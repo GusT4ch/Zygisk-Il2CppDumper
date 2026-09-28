@@ -12,6 +12,7 @@
 #include <sstream>
 #include <fstream>
 #include <unistd.h>
+#include <thread>
 #include "xdl.h"
 #include "log.h"
 #include "il2cpp-tabledefs.h"
@@ -445,6 +446,400 @@ struct GetterTarget {
     const char *label;
 };
 
+// ============================================================
+// Phase 2: Runtime value matching via il2cpp_runtime_invoke
+// Spawns a background thread that waits for a live Player,
+// then calls getters and matches return values against raw
+// field memory to resolve obfuscated backing-field offsets.
+// ============================================================
+
+struct FieldCandidate {
+    const char *name;
+    uint32_t offset;
+    int il2cppType;
+};
+
+static void collect_field_candidates(Il2CppClass *klass, std::vector<FieldCandidate> &out) {
+    while (klass) {
+        void *iter = nullptr;
+        while (auto f = il2cpp_class_get_fields(klass, &iter)) {
+            auto flags = il2cpp_field_get_flags(f);
+            if (flags & FIELD_ATTRIBUTE_STATIC) continue;
+            auto ftype = il2cpp_field_get_type(f);
+            int typeEnum = il2cpp_type_get_type(ftype);
+            uint32_t off = il2cpp_field_get_offset(f);
+            auto fname = il2cpp_field_get_name(f);
+            out.push_back({fname, (uint32_t)off, typeEnum});
+        }
+        klass = il2cpp_class_get_parent(klass);
+        if (klass) {
+            auto pname = il2cpp_class_get_name(klass);
+            if (!pname || strcmp(pname, "Object") == 0 ||
+                strcmp(pname, "MonoBehaviour") == 0) break;
+        }
+    }
+}
+
+static void resolve_offsets_phase2(std::string outDir) {
+    LOGI("=== PHASE 2: Value matching thread started ===");
+
+    auto dom = il2cpp_domain_get();
+    auto thr = il2cpp_thread_attach(dom);
+    LOGI("Phase2: thread attached to domain");
+
+    // Find GameFacade::CurrentLocalPlayer
+    auto facadeK = find_class_all("COW", "GameFacade");
+    if (!facadeK) {
+        LOGE("Phase2: GameFacade not found, aborting");
+        return;
+    }
+    auto clpMethod = il2cpp_class_get_method_from_name(facadeK, "CurrentLocalPlayer", 0);
+    if (!clpMethod || !clpMethod->methodPointer) {
+        LOGE("Phase2: CurrentLocalPlayer method not found, aborting");
+        return;
+    }
+    LOGI("Phase2: CurrentLocalPlayer method at %p", clpMethod->methodPointer);
+
+    // Find target getter methods
+    struct P2Getter {
+        const char *ns;
+        const char *cls;
+        const char *method;
+        const char *label;
+        const MethodInfo *mi;
+        int retType; // IL2CPP_TYPE_* of return
+    };
+
+    P2Getter getters[] = {
+        {"COW.GamePlay", "Player",           "get_CurHP",             "CurHP",       nullptr, IL2CPP_TYPE_I4},
+        {"COW.GamePlay", "Player",           "get_MaxHP",             "MaxHP",       nullptr, IL2CPP_TYPE_I4},
+        {"COW.GamePlay", "Player",           "get_CurEP",            "CurEP",       nullptr, IL2CPP_TYPE_I4},
+        {"COW.GamePlay", "Player",           "get_CurAP",            "CurAP",       nullptr, IL2CPP_TYPE_I4},
+        {"COW.GamePlay", "Player",           "get_OriginalMaxHP",    "OrigMaxHP",   nullptr, IL2CPP_TYPE_I4},
+        {"COW.GamePlay", "Player",           "get_NickName",         "NickName",    nullptr, IL2CPP_TYPE_STRING},
+        {"COW.GamePlay", "Player",           "get_TeamIndex",        "TeamIndex",   nullptr, IL2CPP_TYPE_I4},
+        {"COW.GamePlay", "Player",           "get_HeadBoneTransform","HeadBone",    nullptr, IL2CPP_TYPE_CLASS},
+        {"COW.GamePlay", "Player",           "get_NeckBone",         "NeckBone",    nullptr, IL2CPP_TYPE_CLASS},
+        {"COW.GamePlay", "Player",           "get_HipsBoneTransform","HipsBone",    nullptr, IL2CPP_TYPE_CLASS},
+        {"COW.GamePlay", "AttackableEntity", "get_IsDead",           "IsDead",      nullptr, IL2CPP_TYPE_BOOLEAN},
+    };
+
+    int numGetters = sizeof(getters) / sizeof(getters[0]);
+    for (int i = 0; i < numGetters; ++i) {
+        auto k = find_class_all(getters[i].ns, getters[i].cls);
+        if (k) {
+            getters[i].mi = il2cpp_class_get_method_from_name(k, getters[i].method, 0);
+            if (getters[i].mi)
+                LOGI("Phase2: Found %s at %p", getters[i].label, getters[i].mi->methodPointer);
+            else
+                LOGW("Phase2: Method not found: %s", getters[i].method);
+        }
+    }
+
+    // Collect field candidates from Player hierarchy
+    auto playerK = find_class_all("COW.GamePlay", "Player");
+    if (!playerK) {
+        LOGE("Phase2: Player class not found, aborting");
+        return;
+    }
+    std::vector<FieldCandidate> fields;
+    collect_field_candidates(playerK, fields);
+    LOGI("Phase2: Collected %zu field candidates across hierarchy", fields.size());
+
+    uint32_t playerSize = il2cpp_class_instance_size(playerK);
+
+    // Poll for a live Player instance
+    Il2CppObject *localPlayer = nullptr;
+    for (int attempt = 0; attempt < 120; ++attempt) {
+        Il2CppException *exc = nullptr;
+        auto result = il2cpp_runtime_invoke(clpMethod, nullptr, nullptr, &exc);
+        if (exc) {
+            LOGW("Phase2: CurrentLocalPlayer threw exception, attempt %d", attempt);
+        } else if (result) {
+            localPlayer = result;
+            LOGI("Phase2: Got local player at %p (attempt %d)", localPlayer, attempt);
+            break;
+        }
+        sleep(5);
+    }
+
+    if (!localPlayer) {
+        LOGE("Phase2: Failed to get local player after 120 attempts (10 min), aborting");
+        return;
+    }
+
+    // Small delay to let the player fully initialize in-match
+    sleep(3);
+
+    auto outPath = outDir + "/files/offsets_resolved.txt";
+    std::ofstream out(outPath);
+    if (!out.is_open()) {
+        LOGE("Phase2: Cannot open %s", outPath.c_str());
+        return;
+    }
+
+    out << "// =============================================\n"
+        << "// Phantom Offset Resolver — Phase 2 Results\n"
+        << "// Method: Runtime value matching\n"
+        << "// Player instance at: 0x" << std::hex << (uint64_t)localPlayer << "\n"
+        << "// =============================================\n\n";
+
+    auto rawBase = reinterpret_cast<uint8_t *>(localPlayer);
+
+    // For each getter, call it, get the return value, then scan fields
+    for (int i = 0; i < numGetters; ++i) {
+        if (!getters[i].mi || !getters[i].mi->methodPointer) {
+            out << getters[i].label << " = METHOD_NOT_FOUND\n";
+            continue;
+        }
+
+        Il2CppException *exc = nullptr;
+        Il2CppObject *retObj = nullptr;
+
+        // Call the getter — try up to 3 times
+        for (int retry = 0; retry < 3; ++retry) {
+            exc = nullptr;
+            retObj = il2cpp_runtime_invoke(getters[i].mi, localPlayer, nullptr, &exc);
+            if (!exc) break;
+            LOGW("Phase2: %s threw on attempt %d", getters[i].label, retry);
+            usleep(500000);
+        }
+
+        if (exc || !retObj) {
+            out << getters[i].label << " = INVOKE_FAILED\n";
+            LOGW("Phase2: %s invoke failed", getters[i].label);
+            continue;
+        }
+
+        out << "[" << getters[i].label << "]\n";
+
+        if (getters[i].retType == IL2CPP_TYPE_I4) {
+            // Int32 — unbox and compare against all Int32 fields
+            int32_t val = *(int32_t *)il2cpp_object_unbox(retObj);
+            out << "  getter_value = " << std::dec << val
+                << " (0x" << std::hex << val << ")\n";
+            LOGI("Phase2: %s = %d (0x%X)", getters[i].label, val, val);
+
+            int matches = 0;
+            for (auto &fc : fields) {
+                if (fc.il2cppType != IL2CPP_TYPE_I4 && fc.il2cppType != IL2CPP_TYPE_U4)
+                    continue;
+                if (fc.offset + 4 > playerSize) continue;
+                int32_t memVal = *(int32_t *)(rawBase + fc.offset);
+                if (memVal == val) {
+                    out << "  MATCH " << fc.name << " @ 0x"
+                        << std::hex << fc.offset
+                        << " (mem=" << std::dec << memVal << ")\n";
+                    LOGI("Phase2: %s MATCH %s @ 0x%X = %d",
+                         getters[i].label, fc.name, fc.offset, memVal);
+                    matches++;
+                }
+            }
+            if (matches == 0)
+                out << "  NO_MATCH (value not found in any Int32 field)\n";
+
+        } else if (getters[i].retType == IL2CPP_TYPE_BOOLEAN) {
+            bool val = *(bool *)il2cpp_object_unbox(retObj);
+            out << "  getter_value = " << (val ? "true" : "false") << "\n";
+            LOGI("Phase2: %s = %s", getters[i].label, val ? "true" : "false");
+
+            int matches = 0;
+            for (auto &fc : fields) {
+                if (fc.il2cppType != IL2CPP_TYPE_BOOLEAN) continue;
+                if (fc.offset + 1 > playerSize) continue;
+                bool memVal = *(bool *)(rawBase + fc.offset);
+                if (memVal == val) {
+                    out << "  MATCH " << fc.name << " @ 0x"
+                        << std::hex << fc.offset << "\n";
+                    matches++;
+                }
+            }
+            if (matches == 0)
+                out << "  NO_MATCH\n";
+
+        } else if (getters[i].retType == IL2CPP_TYPE_STRING) {
+            // String — retObj IS the Il2CppString*
+            auto str = reinterpret_cast<Il2CppString *>(retObj);
+            int32_t len = il2cpp_string_length(str);
+            auto chars = il2cpp_string_chars(str);
+            // Convert UTF-16 to ASCII for logging
+            std::string ascii;
+            for (int c = 0; c < len && c < 64; ++c)
+                ascii += (char)(chars[c] & 0x7F);
+            out << "  getter_value = \"" << ascii << "\" (len=" << len << ")\n";
+            LOGI("Phase2: %s = \"%s\" (len=%d)", getters[i].label, ascii.c_str(), len);
+
+            // Match: the field stores a pointer to this same Il2CppString*
+            int matches = 0;
+            for (auto &fc : fields) {
+                if (fc.il2cppType != IL2CPP_TYPE_STRING && fc.il2cppType != IL2CPP_TYPE_CLASS
+                    && fc.il2cppType != IL2CPP_TYPE_OBJECT) continue;
+                if (fc.offset + 8 > playerSize) continue;
+                uint64_t memPtr = *(uint64_t *)(rawBase + fc.offset);
+                if (memPtr == (uint64_t)str) {
+                    out << "  MATCH " << fc.name << " @ 0x"
+                        << std::hex << fc.offset << " (exact ptr)\n";
+                    matches++;
+                } else if (memPtr != 0) {
+                    // Check if it's a different string with same content
+                    auto memStr = reinterpret_cast<Il2CppString *>(memPtr);
+                    // Safety: only deref if the pointer looks like a heap object
+                    if (memPtr > 0x10000 && memPtr < 0x7FFFFFFFFFFF) {
+                        auto memObj = reinterpret_cast<Il2CppObject *>(memPtr);
+                        if (memObj->klass) {
+                            auto klassName = il2cpp_class_get_name(memObj->klass);
+                            if (klassName && strcmp(klassName, "String") == 0) {
+                                int32_t mLen = il2cpp_string_length(memStr);
+                                if (mLen == len) {
+                                    auto mChars = il2cpp_string_chars(memStr);
+                                    bool eq = true;
+                                    for (int c = 0; c < len; ++c) {
+                                        if (mChars[c] != chars[c]) { eq = false; break; }
+                                    }
+                                    if (eq) {
+                                        out << "  MATCH " << fc.name << " @ 0x"
+                                            << std::hex << fc.offset << " (same content, diff ptr)\n";
+                                        matches++;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if (matches == 0)
+                out << "  NO_MATCH\n";
+
+        } else if (getters[i].retType == IL2CPP_TYPE_CLASS) {
+            // Object/Transform pointer — direct pointer comparison
+            uint64_t ptrVal = (uint64_t)retObj;
+            out << "  getter_value = 0x" << std::hex << ptrVal << "\n";
+            LOGI("Phase2: %s = 0x%llX", getters[i].label,
+                 (unsigned long long)ptrVal);
+
+            int matches = 0;
+            for (auto &fc : fields) {
+                if (fc.il2cppType != IL2CPP_TYPE_CLASS && fc.il2cppType != IL2CPP_TYPE_OBJECT
+                    && fc.il2cppType != IL2CPP_TYPE_STRING) continue;
+                if (fc.offset + 8 > playerSize) continue;
+                uint64_t memPtr = *(uint64_t *)(rawBase + fc.offset);
+                if (memPtr == ptrVal) {
+                    out << "  MATCH " << fc.name << " @ 0x"
+                        << std::hex << fc.offset << "\n";
+                    matches++;
+                }
+            }
+            if (matches == 0)
+                out << "  NO_MATCH\n";
+        }
+
+        out << "\n";
+    }
+
+    // === Disambiguation pass: sample Int32 values twice to separate CurHP/MaxHP ===
+    out << "[Disambiguation — Second Sample (3s later)]\n";
+    sleep(3);
+
+    for (int i = 0; i < numGetters; ++i) {
+        if (getters[i].retType != IL2CPP_TYPE_I4) continue;
+        if (!getters[i].mi) continue;
+
+        Il2CppException *exc = nullptr;
+        auto retObj = il2cpp_runtime_invoke(getters[i].mi, localPlayer, nullptr, &exc);
+        if (exc || !retObj) continue;
+
+        int32_t val = *(int32_t *)il2cpp_object_unbox(retObj);
+        out << getters[i].label << " = " << std::dec << val
+            << " (0x" << std::hex << val << ")";
+
+        // Re-scan to see which fields still match
+        for (auto &fc : fields) {
+            if (fc.il2cppType != IL2CPP_TYPE_I4 && fc.il2cppType != IL2CPP_TYPE_U4) continue;
+            if (fc.offset + 4 > playerSize) continue;
+            int32_t memVal = *(int32_t *)(rawBase + fc.offset);
+            if (memVal == val) {
+                out << "  [" << fc.name << "@0x" << std::hex << fc.offset << "]";
+            }
+        }
+        out << "\n";
+    }
+    out << "\n";
+
+    // === Summary: best-guess offset map ===
+    out << "[Summary — Resolved Offset Map]\n";
+    out << "// Format: label = 0x<offset> (<field_name>)\n";
+    out << "// When multiple matches exist, all are listed.\n";
+    out << "// Use disambiguation samples + game knowledge to pick.\n\n";
+
+    for (int i = 0; i < numGetters; ++i) {
+        if (!getters[i].mi) {
+            out << getters[i].label << " = NOT_RESOLVED\n";
+            continue;
+        }
+
+        Il2CppException *exc = nullptr;
+        auto retObj = il2cpp_runtime_invoke(getters[i].mi, localPlayer, nullptr, &exc);
+        if (exc || !retObj) {
+            out << getters[i].label << " = INVOKE_FAILED\n";
+            continue;
+        }
+
+        bool found = false;
+        if (getters[i].retType == IL2CPP_TYPE_I4) {
+            int32_t val = *(int32_t *)il2cpp_object_unbox(retObj);
+            for (auto &fc : fields) {
+                if (fc.il2cppType != IL2CPP_TYPE_I4 && fc.il2cppType != IL2CPP_TYPE_U4) continue;
+                if (fc.offset + 4 > playerSize) continue;
+                if (*(int32_t *)(rawBase + fc.offset) == val) {
+                    out << getters[i].label << " = 0x" << std::hex << fc.offset
+                        << " (" << fc.name << ") val=" << std::dec << val << "\n";
+                    found = true;
+                }
+            }
+        } else if (getters[i].retType == IL2CPP_TYPE_BOOLEAN) {
+            bool val = *(bool *)il2cpp_object_unbox(retObj);
+            for (auto &fc : fields) {
+                if (fc.il2cppType != IL2CPP_TYPE_BOOLEAN) continue;
+                if (fc.offset + 1 > playerSize) continue;
+                if (*(bool *)(rawBase + fc.offset) == val) {
+                    out << getters[i].label << " = 0x" << std::hex << fc.offset
+                        << " (" << fc.name << ") val=" << (val ? "true" : "false") << "\n";
+                    found = true;
+                }
+            }
+        } else if (getters[i].retType == IL2CPP_TYPE_STRING) {
+            auto str = reinterpret_cast<Il2CppString *>(retObj);
+            for (auto &fc : fields) {
+                if (fc.il2cppType != IL2CPP_TYPE_STRING && fc.il2cppType != IL2CPP_TYPE_CLASS) continue;
+                if (fc.offset + 8 > playerSize) continue;
+                uint64_t memPtr = *(uint64_t *)(rawBase + fc.offset);
+                if (memPtr == (uint64_t)str) {
+                    out << getters[i].label << " = 0x" << std::hex << fc.offset
+                        << " (" << fc.name << ") exact_ptr\n";
+                    found = true;
+                }
+            }
+        } else if (getters[i].retType == IL2CPP_TYPE_CLASS) {
+            uint64_t ptrVal = (uint64_t)retObj;
+            for (auto &fc : fields) {
+                if (fc.il2cppType != IL2CPP_TYPE_CLASS && fc.il2cppType != IL2CPP_TYPE_OBJECT) continue;
+                if (fc.offset + 8 > playerSize) continue;
+                if (*(uint64_t *)(rawBase + fc.offset) == ptrVal) {
+                    out << getters[i].label << " = 0x" << std::hex << fc.offset
+                        << " (" << fc.name << ") exact_ptr\n";
+                    found = true;
+                }
+            }
+        }
+
+        if (!found)
+            out << getters[i].label << " = NOT_RESOLVED\n";
+    }
+
+    out.close();
+    LOGI("=== PHASE 2 DONE — %s ===", outPath.c_str());
+}
+
 static void resolve_offsets(const char *outDir) {
     LOGI("=== OFFSET RESOLVER START ===");
 
@@ -638,6 +1033,12 @@ static void resolve_offsets(const char *outDir) {
 
     out.close();
     LOGI("=== OFFSET RESOLVER DONE — %s ===", outPath.c_str());
+
+    // Spawn Phase 2 background thread for runtime value matching
+    std::string dirCopy(outDir);
+    std::thread phase2(resolve_offsets_phase2, dirCopy);
+    phase2.detach();
+    LOGI("Phase 2 thread spawned — enter a match to resolve COMPLEX offsets");
 }
 
 // ============================================================
