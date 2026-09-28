@@ -1,10 +1,13 @@
 name: Build
 on:
+  push:
+    branches: [ offset-resolver ]
   workflow_dispatch:
       inputs:
         package_name:
-          description: "Package name of the game:"
-          required: true
+          description: "Package name of the game (leave empty if already hardcoded):"
+          required: false
+          default: ""
 
 jobs:
   build:
@@ -18,10 +21,13 @@ jobs:
         cache: gradle
     - run: |
         chmod +x ./gradlew
-        sed -i 's/moduleDescription = "/moduleDescription = "(${{ github.event.inputs.package_name }}) /g' module.gradle
-        sed -i "s/com.game.packagename/${{ github.event.inputs.package_name }}/g" module/src/main/cpp/game.h
+        PKG="${{ github.event.inputs.package_name }}"
+        if [ -n "$PKG" ]; then
+          sed -i "s/moduleDescription = \"/moduleDescription = \"($PKG) /g" module.gradle
+          sed -i "s/com.game.packagename/$PKG/g" module/src/main/cpp/game.h
+        fi
         ./gradlew :module:assembleRelease
     - uses: actions/upload-artifact@v4
       with:
-        name: zygisk-il2cppdumper
+        name: zygisk-offset-resolver
         path: out/magisk_module_release/
