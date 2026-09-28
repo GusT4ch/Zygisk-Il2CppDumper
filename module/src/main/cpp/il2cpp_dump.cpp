@@ -343,6 +343,305 @@ void il2cpp_api_init(void *handle) {
     il2cpp_thread_attach(domain);
 }
 
+// ============================================================
+// ARM64 getter instruction parser
+// Scans the first N instructions of a property getter for
+// LDR/LDRB/LDRH patterns that load a field from 'this' (x0).
+// Tracks simple register moves (MOV Xd, X0) so it handles
+// getters that save 'this' to a callee-saved register first.
+// ============================================================
+
+static Il2CppClass *find_class_all(const char *ns, const char *name) {
+    size_t sz;
+    auto dom = il2cpp_domain_get();
+    auto asms = il2cpp_domain_get_assemblies(dom, &sz);
+    for (size_t i = 0; i < sz; ++i) {
+        auto img = il2cpp_assembly_get_image(asms[i]);
+        auto k = il2cpp_class_from_name(img, ns, name);
+        if (k) return k;
+    }
+    return nullptr;
+}
+
+struct ParsedField {
+    uint32_t offset;
+    const char *type;
+};
+
+static bool parse_arm64_getter(void *funcPtr, ParsedField *out) {
+    if (!funcPtr) return false;
+    auto code = reinterpret_cast<uint32_t *>(funcPtr);
+
+    int thisReg = 0; // x0
+
+    for (int i = 0; i < 20; ++i) {
+        uint32_t insn = code[i];
+        uint32_t Rn = (insn >> 5) & 0x1F;
+
+        // MOV Xd, Xn → ORR Xd, XZR, Xn
+        // 64-bit: 1010 1010 000 Rm(5) 000000 11111 Rd(5)
+        if ((insn & 0xFFE0FFE0) == 0xAA0003E0) {
+            uint32_t Rm = (insn >> 16) & 0x1F;
+            uint32_t Rd = insn & 0x1F;
+            if ((int)Rm == thisReg) thisReg = (int)Rd;
+            continue;
+        }
+
+        if ((int)Rn != thisReg) {
+            // RET — stop
+            if ((insn & 0xFFFFFC1F) == 0xD65F0000) break;
+            // Unconditional branch (B/BL) — stop
+            if ((insn & 0x7C000000) == 0x14000000) break;
+            continue;
+        }
+
+        // --- LDR Wt, [Xn, #imm12*4] — 32-bit int ---
+        if ((insn & 0xFFC00000) == 0xB9400000) {
+            out->offset = ((insn >> 10) & 0xFFF) * 4;
+            out->type = "Int32";
+            return true;
+        }
+        // --- LDR Xt, [Xn, #imm12*8] — 64-bit ptr ---
+        if ((insn & 0xFFC00000) == 0xF9400000) {
+            out->offset = ((insn >> 10) & 0xFFF) * 8;
+            out->type = "Ptr64";
+            return true;
+        }
+        // --- LDRB Wt, [Xn, #imm12] — byte/bool ---
+        if ((insn & 0xFFC00000) == 0x39400000) {
+            out->offset = (insn >> 10) & 0xFFF;
+            out->type = "Bool";
+            return true;
+        }
+        // --- LDRH Wt, [Xn, #imm12*2] — 16-bit ---
+        if ((insn & 0xFFC00000) == 0x79400000) {
+            out->offset = ((insn >> 10) & 0xFFF) * 2;
+            out->type = "UInt16";
+            return true;
+        }
+        // --- LDR St, [Xn, #imm12*4] — float ---
+        if ((insn & 0xFFC00000) == 0xBD400000) {
+            out->offset = ((insn >> 10) & 0xFFF) * 4;
+            out->type = "Float";
+            return true;
+        }
+        // --- ADD Xd, Xn, #imm — value-type address return ---
+        if ((insn & 0xFF000000) == 0x91000000) {
+            uint32_t imm12 = (insn >> 10) & 0xFFF;
+            uint32_t sh = (insn >> 22) & 1;
+            out->offset = sh ? (imm12 << 12) : imm12;
+            out->type = "ValueAddr";
+            return true;
+        }
+    }
+    return false;
+}
+
+struct GetterTarget {
+    const char *ns;
+    const char *cls;
+    const char *method;
+    int params;
+    const char *label;
+};
+
+static void resolve_offsets(const char *outDir) {
+    LOGI("=== OFFSET RESOLVER START ===");
+
+    auto outPath = std::string(outDir) + "/files/offsets.txt";
+    std::ofstream out(outPath);
+    if (!out.is_open()) {
+        LOGE("Cannot open %s for writing", outPath.c_str());
+        return;
+    }
+
+    out << "// =============================================\n"
+        << "// Phantom Offset Resolver — Free Fire 1.132.1\n"
+        << "// Method: ARM64 getter instruction parsing\n"
+        << "// =============================================\n\n";
+
+    // 1. Find target classes
+    auto playerK    = find_class_all("COW.GamePlay", "Player");
+    auto attackK    = find_class_all("COW.GamePlay", "AttackableEntity");
+    auto entityK    = find_class_all("GCommon",      "Entity");
+    auto facadeK    = find_class_all("COW",          "GameFacade");
+    auto matchK     = find_class_all("COW",          "MatchGame");
+
+    out << "[Classes]\n";
+    out << "Player           = " << (playerK  ? "FOUND" : "MISSING") << "\n";
+    out << "AttackableEntity = " << (attackK  ? "FOUND" : "MISSING") << "\n";
+    out << "Entity           = " << (entityK  ? "FOUND" : "MISSING") << "\n";
+    out << "GameFacade       = " << (facadeK  ? "FOUND" : "MISSING") << "\n";
+    out << "MatchGame        = " << (matchK   ? "FOUND" : "MISSING") << "\n\n";
+
+    LOGI("Classes: Player=%p Attack=%p Entity=%p Facade=%p Match=%p",
+         playerK, attackK, entityK, facadeK, matchK);
+
+    // 2. Resolve getter backing-field offsets via ARM64 parsing
+    GetterTarget targets[] = {
+        {"COW.GamePlay", "Player", "get_CurHP",               0, "Player::CurHP"},
+        {"COW.GamePlay", "Player", "get_MaxHP",               0, "Player::MaxHP"},
+        {"COW.GamePlay", "Player", "get_CurEP",               0, "Player::CurEP"},
+        {"COW.GamePlay", "Player", "get_CurAP",               0, "Player::CurAP"},
+        {"COW.GamePlay", "Player", "get_OriginalMaxHP",       0, "Player::OriginalMaxHP"},
+        {"COW.GamePlay", "Player", "get_NickName",            0, "Player::NickName"},
+        {"COW.GamePlay", "Player", "get_TeamIndex",           0, "Player::TeamIndex"},
+        {"COW.GamePlay", "Player", "get_HeadBoneTransform",   0, "Player::HeadBone"},
+        {"COW.GamePlay", "Player", "get_NeckBone",            0, "Player::NeckBone"},
+        {"COW.GamePlay", "Player", "get_HipsBoneTransform",   0, "Player::HipsBone"},
+        {"COW.GamePlay", "Player", "get_BipBoneTransform",    0, "Player::BipBone"},
+        {"COW.GamePlay", "Player", "get_ShoulderBoneTransform", 0, "Player::ShoulderBone"},
+        {"COW.GamePlay", "Player", "get_HandBoneLeft",        0, "Player::HandBoneLeft"},
+        {"COW.GamePlay", "Player", "get_HandBoneRight",       0, "Player::HandBoneRight"},
+        {"COW.GamePlay", "Player", "get_RightLegBoneTransform", 0, "Player::RightLegBone"},
+        {"COW.GamePlay", "Player", "get_BoneLeftWeapon",      0, "Player::BoneLeftWeapon"},
+        {"COW.GamePlay", "AttackableEntity", "get_IsDead",    0, "AttackableEntity::IsDead"},
+        {"GCommon",      "Entity", "get_Position",            0, "Entity::Position"},
+    };
+
+    out << "[Getter Offsets — ARM64 Parsed]\n";
+
+    for (auto &t : targets) {
+        auto klass = find_class_all(t.ns, t.cls);
+        if (!klass) {
+            out << t.label << " = CLASS_NOT_FOUND\n";
+            continue;
+        }
+        auto mi = il2cpp_class_get_method_from_name(klass, t.method, t.params);
+        if (!mi || !mi->methodPointer) {
+            out << t.label << " = METHOD_NOT_FOUND\n";
+            continue;
+        }
+
+        uint64_t rva = (uint64_t)mi->methodPointer - il2cpp_base;
+        ParsedField pf{};
+        if (parse_arm64_getter(reinterpret_cast<void *>(mi->methodPointer), &pf)) {
+            out << t.label << " = 0x" << std::hex << pf.offset
+                << "  (" << pf.type << ")  [RVA 0x" << rva << "]\n";
+            LOGI("RESOLVED  %s = 0x%X (%s)", t.label, pf.offset, pf.type);
+        } else {
+            // Dump raw instructions for manual analysis
+            auto c = reinterpret_cast<uint32_t *>(mi->methodPointer);
+            out << t.label << " = COMPLEX  [RVA 0x" << std::hex << rva << "]  insns:";
+            for (int j = 0; j < 8; ++j)
+                out << " " << std::hex << c[j];
+            out << "\n";
+            LOGW("COMPLEX  %s  RVA 0x%llX", t.label, (unsigned long long)rva);
+        }
+    }
+    out << "\n";
+
+    // 3. Enumerate all fields of target classes
+    struct ClassEntry { Il2CppClass *k; const char *name; };
+    ClassEntry classes[] = {
+        {playerK,  "Player"},
+        {attackK,  "AttackableEntity"},
+        {entityK,  "Entity"},
+        {facadeK,  "GameFacade"},
+        {matchK,   "MatchGame"},
+    };
+
+    for (auto &ce : classes) {
+        if (!ce.k) continue;
+        out << "[Fields: " << ce.name << "]  InstanceSize=0x"
+            << std::hex << il2cpp_class_instance_size(ce.k) << "\n";
+        void *iter = nullptr;
+        while (auto f = il2cpp_class_get_fields(ce.k, &iter)) {
+            auto fname = il2cpp_field_get_name(f);
+            auto ftype = il2cpp_field_get_type(f);
+            auto fcls  = il2cpp_class_from_type(ftype);
+            auto tname = il2cpp_class_get_name(fcls);
+            auto off   = il2cpp_field_get_offset(f);
+            auto flags = il2cpp_field_get_flags(f);
+            bool stat  = (flags & FIELD_ATTRIBUTE_STATIC) != 0;
+            out << "  " << (stat ? "static " : "")
+                << tname << " " << fname
+                << " // 0x" << std::hex << off << "\n";
+        }
+        out << "\n";
+    }
+
+    // 4. Method RVAs
+    struct MethodTarget {
+        const char *ns; const char *cls; const char *method;
+        int params; const char *label;
+    };
+    MethodTarget mtargets[] = {
+        {"COW",          "GameFacade", "CurrentLocalPlayer",          0, "GameFacade::CurrentLocalPlayer"},
+        {"COW",          "GameFacade", "IsLocalTeammate",             1, "GameFacade::IsLocalTeammate"},
+        {"COW",          "GameFacade", "CurrentLocalPlayerTeamIndex", 0, "GameFacade::CurrentLocalPlayerTeamIndex"},
+        {"COW.GamePlay", "Player",     "get_CurHP",                  0, "Player::get_CurHP"},
+        {"COW.GamePlay", "Player",     "get_MaxHP",                  0, "Player::get_MaxHP"},
+        {"COW.GamePlay", "Player",     "get_NickName",               0, "Player::get_NickName"},
+        {"COW.GamePlay", "Player",     "get_HeadBoneTransform",      0, "Player::get_HeadBoneTransform"},
+        {"COW.GamePlay", "AttackableEntity", "get_IsDead",           0, "AttackableEntity::get_IsDead"},
+        {"GCommon",      "Entity",     "get_Position",               0, "Entity::get_Position"},
+    };
+
+    out << "[Method RVAs]\n";
+    for (auto &mt : mtargets) {
+        auto klass = find_class_all(mt.ns, mt.cls);
+        if (!klass) { out << mt.label << " = CLASS_NOT_FOUND\n"; continue; }
+        auto mi = il2cpp_class_get_method_from_name(klass, mt.method, mt.params);
+        if (!mi || !mi->methodPointer) { out << mt.label << " = NOT_FOUND\n"; continue; }
+        uint64_t rva = (uint64_t)mi->methodPointer - il2cpp_base;
+        out << mt.label << "  RVA=0x" << std::hex << rva
+            << "  VA=0x" << (uint64_t)mi->methodPointer << "\n";
+    }
+    out << "\n";
+
+    // 5. Static field data pointers
+    out << "[Static Field Addresses]\n";
+    if (facadeK) {
+        auto sd = il2cpp_class_get_static_field_data(facadeK);
+        out << "GameFacade.StaticFieldData = 0x" << std::hex << (uint64_t)sd << "\n";
+        auto f1 = il2cpp_class_get_field_from_name(facadeK, "CurrentMatchGame");
+        if (f1) out << "GameFacade.CurrentMatchGame  offset=0x"
+                     << std::hex << il2cpp_field_get_offset(f1) << " (static)\n";
+        auto f2 = il2cpp_class_get_field_from_name(facadeK, "LocalPlayerUserID");
+        if (f2) out << "GameFacade.LocalPlayerUserID offset=0x"
+                     << std::hex << il2cpp_field_get_offset(f2) << " (static)\n";
+    }
+    out << "\n";
+
+    // 6. Non-obfuscated instance fields (direct names)
+    out << "[Known Fields — Direct Name]\n";
+    auto try_field = [&](Il2CppClass *k, const char *cls, const char *name) {
+        if (!k) return;
+        auto f = il2cpp_class_get_field_from_name(k, name);
+        if (f) {
+            out << cls << "::" << name << " = 0x"
+                << std::hex << il2cpp_field_get_offset(f) << "\n";
+        }
+    };
+    try_field(entityK,  "Entity",    "m_CachedTransform");
+    try_field(entityK,  "Entity",    "m_UniqueID");
+    try_field(matchK,   "MatchGame", "m_ReplicationEntitis");
+    try_field(matchK,   "MatchGame", "m_CameraControllerManager");
+    try_field(facadeK,  "GameFacade","CurrentMatchGame");
+    try_field(facadeK,  "GameFacade","LocalPlayerUserID");
+    out << "\n";
+
+    // 7. Runtime info
+    out << "[Runtime]\n";
+    out << "il2cpp_base         = 0x" << std::hex << il2cpp_base << "\n";
+    out << "object_header_size  = "   << std::dec << il2cpp_object_header_size() << "\n";
+    if (playerK) {
+        out << "Player.InstanceSize = 0x" << std::hex
+            << il2cpp_class_instance_size(playerK) << "\n";
+        out << "Player.Class        = 0x" << std::hex << (uint64_t)playerK << "\n";
+    }
+    if (facadeK) {
+        out << "GameFacade.Class    = 0x" << std::hex << (uint64_t)facadeK << "\n";
+    }
+    out << "\n";
+
+    out.close();
+    LOGI("=== OFFSET RESOLVER DONE — %s ===", outPath.c_str());
+}
+
+// ============================================================
+
 void il2cpp_dump(const char *outDir) {
     LOGI("dumping...");
     size_t size;
@@ -356,7 +655,6 @@ void il2cpp_dump(const char *outDir) {
     std::vector<std::string> outPuts;
     if (il2cpp_image_get_class) {
         LOGI("Version greater than 2018.3");
-        //使用il2cpp_image_get_class
         for (int i = 0; i < size; ++i) {
             auto image = il2cpp_assembly_get_image(assemblies[i]);
             std::stringstream imageStr;
@@ -365,14 +663,12 @@ void il2cpp_dump(const char *outDir) {
             for (int j = 0; j < classCount; ++j) {
                 auto klass = il2cpp_image_get_class(image, j);
                 auto type = il2cpp_class_get_type(const_cast<Il2CppClass *>(klass));
-                //LOGD("type name : %s", il2cpp_type_get_name(type));
                 auto outPut = imageStr.str() + dump_type(type);
                 outPuts.push_back(outPut);
             }
         }
     } else {
         LOGI("Version less than 2018.3");
-        //使用反射
         auto corlib = il2cpp_get_corlib();
         auto assemblyClass = il2cpp_class_from_name(corlib, "System.Reflection", "Assembly");
         auto assemblyLoad = il2cpp_class_get_method_from_name(assemblyClass, "Load", 1);
@@ -396,7 +692,6 @@ void il2cpp_dump(const char *outDir) {
             std::stringstream imageStr;
             auto image_name = il2cpp_image_get_name(image);
             imageStr << "\n// Dll : " << image_name;
-            //LOGD("image name : %s", image->name);
             auto imageName = std::string(image_name);
             auto pos = imageName.rfind('.');
             auto imageNameNoExt = imageName.substr(0, pos);
@@ -410,7 +705,6 @@ void il2cpp_dump(const char *outDir) {
             for (int j = 0; j < reflectionTypes->max_length; ++j) {
                 auto klass = il2cpp_class_from_system_type((Il2CppReflectionType *) items[j]);
                 auto type = il2cpp_class_get_type(klass);
-                //LOGD("type name : %s", il2cpp_type_get_name(type));
                 auto outPut = imageStr.str() + dump_type(type);
                 outPuts.push_back(outPut);
             }
@@ -426,4 +720,6 @@ void il2cpp_dump(const char *outDir) {
     }
     outStream.close();
     LOGI("dump done!");
+
+    resolve_offsets(outDir);
 }
