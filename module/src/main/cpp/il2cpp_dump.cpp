@@ -1528,27 +1528,29 @@ static void resolve_offsets_phase4(std::string outDir) {
     }
 
     Il2CppObject *localPlayer = nullptr;
-    for (int attempt = 0; attempt < 120; ++attempt) {
+    int32_t curHP = 0, maxHP = 0;
+
+    for (int attempt = 0; attempt < 180; ++attempt) {
         Il2CppException *exc = nullptr;
         auto r = il2cpp_runtime_invoke(clpMethod, nullptr, nullptr, &exc);
-        if (!exc && r) { localPlayer = r; break; }
+        if (!exc && r) {
+            localPlayer = r;
+            // Check if player is alive (HP > 0)
+            exc = nullptr;
+            auto rHP = il2cpp_runtime_invoke(getCurHP, localPlayer, nullptr, &exc);
+            if (!exc && rHP) curHP = *(int32_t *)il2cpp_object_unbox(rHP);
+            exc = nullptr;
+            auto rMax = il2cpp_runtime_invoke(getMaxHP, localPlayer, nullptr, &exc);
+            if (!exc && rMax) maxHP = *(int32_t *)il2cpp_object_unbox(rMax);
+
+            if (curHP > 0 && maxHP > 0) break;
+            LOGI("Phase4: waiting for alive player (CurHP=%d MaxHP=%d, attempt %d)", curHP, maxHP, attempt);
+        }
         sleep(3);
     }
-    if (!localPlayer) {
-        out << "Phase4: No player found\n";
+    if (!localPlayer || curHP <= 0 || maxHP <= 0) {
+        out << "Phase4: Player not alive after 9min wait (CurHP=" << curHP << " MaxHP=" << maxHP << ")\n";
         out.close(); return;
-    }
-
-    int32_t curHP = 0, maxHP = 0;
-    {
-        Il2CppException *exc = nullptr;
-        auto r = il2cpp_runtime_invoke(getCurHP, localPlayer, nullptr, &exc);
-        if (!exc && r) curHP = *(int32_t *)il2cpp_object_unbox(r);
-    }
-    {
-        Il2CppException *exc = nullptr;
-        auto r = il2cpp_runtime_invoke(getMaxHP, localPlayer, nullptr, &exc);
-        if (!exc && r) maxHP = *(int32_t *)il2cpp_object_unbox(r);
     }
 
     out << "// =============================================\n"
