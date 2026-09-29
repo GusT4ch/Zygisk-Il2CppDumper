@@ -1074,10 +1074,11 @@ static void resolve_offsets(const char *outDir) {
     std::string dirCopy6(outDir);
     std::thread phase7(resolve_offsets_phase7, dirCopy6);
     phase7.detach();
-    std::string dirCopy7(outDir);
-    std::thread phase8(resolve_offsets_phase8, dirCopy7);
-    phase8.detach();
-    LOGI("Phase 2-8 threads spawned — enter a match to resolve offsets");
+    // Phase 8 disabled — was crashing FF
+    // std::string dirCopy7(outDir);
+    // std::thread phase8(resolve_offsets_phase8, dirCopy7);
+    // phase8.detach();
+    LOGI("Phase 2-7 threads spawned — enter a match to resolve offsets");
 }
 
 // ============================================================
