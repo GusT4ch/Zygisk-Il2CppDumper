@@ -449,6 +449,7 @@ struct GetterTarget {
 // Forward declarations
 static void resolve_offsets_phase2(std::string outDir);
 static void resolve_offsets_phase3(std::string outDir);
+static void resolve_offsets_phase4(std::string outDir);
 
 // ============================================================
 // Phase 2: Runtime value matching via il2cpp_runtime_invoke
@@ -1056,7 +1057,10 @@ static void resolve_offsets(const char *outDir) {
     phase2.detach();
     std::thread phase3(resolve_offsets_phase3, dirCopy2);
     phase3.detach();
-    LOGI("Phase 2+3 threads spawned — enter a match to resolve offsets");
+    std::string dirCopy3(outDir);
+    std::thread phase4(resolve_offsets_phase4, dirCopy3);
+    phase4.detach();
+    LOGI("Phase 2+3+4 threads spawned — enter a match to resolve offsets");
 }
 
 // ============================================================
@@ -1435,6 +1439,392 @@ static void resolve_offsets_phase3(std::string outDir) {
 
     out.close();
     LOGI("=== PHASE 3 DONE — %s ===", outPath.c_str());
+}
+
+// ============================================================
+// Phase 4: COW HP Deep Scan
+// Follows pointer chains to find where CurHP/MaxHP are stored
+// in COW sub-objects, and iterates remote players for correlation.
+// ============================================================
+
+static void dump_subobject_int32_fields(std::ofstream &out, Il2CppObject *obj,
+                                         const char *prefix, int32_t curHP, int32_t maxHP) {
+    if (!obj || !obj->klass) return;
+    uint32_t sz = il2cpp_class_instance_size(obj->klass);
+    auto base = reinterpret_cast<uint8_t *>(obj);
+
+    void *it = nullptr;
+    while (auto f = il2cpp_class_get_fields(obj->klass, &it)) {
+        auto fl = il2cpp_field_get_flags(f);
+        if (fl & FIELD_ATTRIBUTE_STATIC) continue;
+        auto ft = il2cpp_field_get_type(f);
+        int te = il2cpp_type_get_type(ft);
+        auto fn = il2cpp_field_get_name(f);
+        uint32_t fo = il2cpp_field_get_offset(f);
+
+        auto fcls = il2cpp_class_from_type(ft);
+        auto tn = fcls ? il2cpp_class_get_name(fcls) : "?";
+
+        out << prefix << "0x" << std::hex << fo << " " << tn << " " << fn;
+
+        if (te == IL2CPP_TYPE_I4 && fo + 4 <= sz) {
+            int32_t v = *(int32_t *)(base + fo);
+            out << " = " << std::dec << v;
+            if (v == curHP) out << " *** CurHP ***";
+            if (v == maxHP) out << " *** MaxHP ***";
+        } else if (te == IL2CPP_TYPE_R4 && fo + 4 <= sz) {
+            float v = *(float *)(base + fo);
+            out << " = " << v << "f";
+        } else if (te == IL2CPP_TYPE_BOOLEAN && fo + 1 <= sz) {
+            out << " = " << (*(bool *)(base + fo) ? "true" : "false");
+        } else if (te == IL2CPP_TYPE_I2 && fo + 2 <= sz) {
+            out << " = " << std::dec << *(int16_t *)(base + fo);
+        } else if ((te == IL2CPP_TYPE_CLASS || te == IL2CPP_TYPE_OBJECT) && fo + 8 <= sz) {
+            uint64_t p = *(uint64_t *)(base + fo);
+            out << " = 0x" << std::hex << p;
+            if (p > 0x10000 && p < 0x7FFFFFFFFFFF) {
+                auto o = reinterpret_cast<Il2CppObject *>(p);
+                if (o->klass) {
+                    auto n = il2cpp_class_get_name(o->klass);
+                    auto ns = il2cpp_class_get_namespace(o->klass);
+                    out << " -> " << (ns && ns[0] ? ns : "") << "::" << (n ? n : "?");
+                }
+            }
+        }
+        out << "\n";
+    }
+}
+
+static void resolve_offsets_phase4(std::string outDir) {
+    LOGI("=== PHASE 4: COW HP deep scan ===");
+    sleep(10);
+
+    auto dom = il2cpp_domain_get();
+    if (!dom) { LOGE("Phase4: domain null"); return; }
+    auto thr = il2cpp_thread_attach(dom);
+    if (!thr) { LOGE("Phase4: thread attach fail"); return; }
+
+    auto outPath = outDir + "/files/hp_deep_scan.txt";
+    std::ofstream out(outPath);
+    if (!out.is_open()) {
+        LOGE("Phase4: Cannot open %s", outPath.c_str());
+        return;
+    }
+
+    auto facadeK = find_class_all("COW", "GameFacade");
+    auto playerK = find_class_all("COW.GamePlay", "Player");
+    auto matchK  = find_class_all("COW", "MatchGame");
+    if (!facadeK || !playerK) {
+        out << "Phase4: Missing classes\n";
+        out.close(); return;
+    }
+
+    auto clpMethod = il2cpp_class_get_method_from_name(facadeK, "CurrentLocalPlayer", 0);
+    auto getCurHP  = il2cpp_class_get_method_from_name(playerK, "get_CurHP", 0);
+    auto getMaxHP  = il2cpp_class_get_method_from_name(playerK, "get_MaxHP", 0);
+    if (!clpMethod || !getCurHP || !getMaxHP || !getCurHP->methodPointer) {
+        out << "Phase4: Missing methods\n";
+        out.close(); return;
+    }
+
+    Il2CppObject *localPlayer = nullptr;
+    for (int attempt = 0; attempt < 120; ++attempt) {
+        Il2CppException *exc = nullptr;
+        auto r = il2cpp_runtime_invoke(clpMethod, nullptr, nullptr, &exc);
+        if (!exc && r) { localPlayer = r; break; }
+        sleep(3);
+    }
+    if (!localPlayer) {
+        out << "Phase4: No player found\n";
+        out.close(); return;
+    }
+
+    int32_t curHP = 0, maxHP = 0;
+    {
+        Il2CppException *exc = nullptr;
+        auto r = il2cpp_runtime_invoke(getCurHP, localPlayer, nullptr, &exc);
+        if (!exc && r) curHP = *(int32_t *)il2cpp_object_unbox(r);
+    }
+    {
+        Il2CppException *exc = nullptr;
+        auto r = il2cpp_runtime_invoke(getMaxHP, localPlayer, nullptr, &exc);
+        if (!exc && r) maxHP = *(int32_t *)il2cpp_object_unbox(r);
+    }
+
+    out << "// =============================================\n"
+        << "// Phantom Phase 4 — COW HP Deep Scan\n"
+        << "// =============================================\n\n"
+        << "Player* = 0x" << std::hex << (uint64_t)localPlayer << "\n"
+        << "CurHP = " << std::dec << curHP << "  (0x" << std::hex << curHP << ")\n"
+        << "MaxHP = " << std::dec << maxHP << "  (0x" << std::hex << maxHP << ")\n\n";
+
+    auto rawBase = reinterpret_cast<uint8_t *>(localPlayer);
+    uint32_t pSize = il2cpp_class_instance_size(playerK);
+
+    // === 1. Scan ALL pointer sub-objects for HP values (1 + 2 levels deep) ===
+    out << "[Deep Pointer Scan — CurHP=" << std::dec << curHP
+        << " MaxHP=" << maxHP << "]\n";
+
+    void *iter = nullptr;
+    while (auto f = il2cpp_class_get_fields(playerK, &iter)) {
+        auto flags = il2cpp_field_get_flags(f);
+        if (flags & FIELD_ATTRIBUTE_STATIC) continue;
+        auto ftype = il2cpp_field_get_type(f);
+        int typeEnum = il2cpp_type_get_type(ftype);
+        if (typeEnum != IL2CPP_TYPE_CLASS && typeEnum != IL2CPP_TYPE_OBJECT) continue;
+
+        uint32_t off = il2cpp_field_get_offset(f);
+        if (off + 8 > pSize) continue;
+        uint64_t ptr = *(uint64_t *)(rawBase + off);
+        if (ptr == 0 || ptr < 0x10000 || ptr > 0x7FFFFFFFFFFF) continue;
+
+        auto obj = reinterpret_cast<Il2CppObject *>(ptr);
+        if (!obj->klass) continue;
+
+        uint32_t subSize = il2cpp_class_instance_size(obj->klass);
+        if (subSize < 16) continue;
+
+        auto subBase = reinterpret_cast<uint8_t *>(ptr);
+        auto fname = il2cpp_field_get_name(f);
+        auto kName = il2cpp_class_get_name(obj->klass);
+        auto kNs   = il2cpp_class_get_namespace(obj->klass);
+
+        // Level 1: scan this sub-object for HP values
+        bool foundCur = false, foundMax = false;
+        for (uint32_t s = 0x10; s + 4 <= subSize; s += 4) {
+            int32_t v = *(int32_t *)(subBase + s);
+            if (v == curHP && curHP != 0) foundCur = true;
+            if (v == maxHP && maxHP != 0) foundMax = true;
+        }
+
+        if (foundCur || foundMax) {
+            out << "  L1 HIT: +0x" << std::hex << off << " " << fname
+                << " -> " << (kNs && kNs[0] ? kNs : "") << "::" << (kName ? kName : "?")
+                << " (size=0x" << subSize << ")\n";
+            for (uint32_t s = 0x10; s + 4 <= subSize; s += 4) {
+                int32_t v = *(int32_t *)(subBase + s);
+                if (v == curHP && curHP != 0)
+                    out << "    [+0x" << std::hex << s << "] = " << std::dec << v << " *** CurHP ***\n";
+                if (v == maxHP && maxHP != 0)
+                    out << "    [+0x" << std::hex << s << "] = " << std::dec << v << " *** MaxHP ***\n";
+            }
+        }
+
+        // Level 2: follow nested pointers
+        void *subIter = nullptr;
+        while (auto sf = il2cpp_class_get_fields(obj->klass, &subIter)) {
+            auto sfl = il2cpp_field_get_flags(sf);
+            if (sfl & FIELD_ATTRIBUTE_STATIC) continue;
+            auto sft = il2cpp_field_get_type(sf);
+            int ste = il2cpp_type_get_type(sft);
+            if (ste != IL2CPP_TYPE_CLASS && ste != IL2CPP_TYPE_OBJECT) continue;
+
+            uint32_t soff = il2cpp_field_get_offset(sf);
+            if (soff + 8 > subSize) continue;
+            uint64_t sptr = *(uint64_t *)(subBase + soff);
+            if (sptr == 0 || sptr < 0x10000 || sptr > 0x7FFFFFFFFFFF) continue;
+
+            auto sobj = reinterpret_cast<Il2CppObject *>(sptr);
+            if (!sobj->klass) continue;
+
+            uint32_t ssSize = il2cpp_class_instance_size(sobj->klass);
+            if (ssSize < 16 || ssSize > 0x1000) continue;
+            auto ssBase = reinterpret_cast<uint8_t *>(sptr);
+
+            for (uint32_t ss = 0x10; ss + 4 <= ssSize; ss += 4) {
+                int32_t v = *(int32_t *)(ssBase + ss);
+                if ((v == curHP && curHP != 0) || (v == maxHP && maxHP != 0)) {
+                    auto sfn = il2cpp_field_get_name(sf);
+                    auto skN = il2cpp_class_get_name(sobj->klass);
+                    auto skNs = il2cpp_class_get_namespace(sobj->klass);
+                    out << "  L2 HIT: +0x" << std::hex << off << "." << sfn
+                        << " -> " << (skNs && skNs[0] ? skNs : "") << "::" << (skN ? skN : "?")
+                        << " [+0x" << ss << "] = " << std::dec << v;
+                    if (v == curHP) out << " *** CurHP ***";
+                    if (v == maxHP) out << " *** MaxHP ***";
+                    out << "\n";
+                }
+            }
+        }
+    }
+
+    // === 2. Deep dump of PlayerAttributes (Player+0x768) ===
+    out << "\n[PlayerAttributes Full Dump (Player+0x768)]\n";
+    {
+        uint64_t paPtr = *(uint64_t *)(rawBase + 0x768);
+        if (paPtr && paPtr > 0x10000 && paPtr < 0x7FFFFFFFFFFF) {
+            auto paObj = reinterpret_cast<Il2CppObject *>(paPtr);
+            if (paObj->klass) {
+                auto n = il2cpp_class_get_name(paObj->klass);
+                auto ns = il2cpp_class_get_namespace(paObj->klass);
+                uint32_t sz = il2cpp_class_instance_size(paObj->klass);
+                out << "  Class: " << (ns && ns[0] ? ns : "") << "::" << (n ? n : "?")
+                    << "  Size: 0x" << std::hex << sz << "\n  Fields:\n";
+                dump_subobject_int32_fields(out, paObj, "    ", curHP, maxHP);
+
+                // Raw hex dump
+                auto paBase = reinterpret_cast<uint8_t *>(paPtr);
+                uint32_t dumpLen = sz < 0x600 ? sz : 0x600;
+                out << "  Raw (" << std::dec << dumpLen << " bytes):\n";
+                for (uint32_t d = 0; d < dumpLen; d += 0x10) {
+                    out << "    +" << std::hex << d << ":";
+                    for (uint32_t b = 0; b < 16 && d + b < dumpLen; ++b) {
+                        char hex[4];
+                        snprintf(hex, sizeof(hex), " %02X", paBase[d + b]);
+                        out << hex;
+                    }
+                    // Also show Int32 interpretation
+                    out << "  |";
+                    for (uint32_t b = 0; b + 4 <= 16 && d + b + 4 <= dumpLen; b += 4) {
+                        int32_t iv = *(int32_t *)(paBase + d + b);
+                        out << " " << std::dec << iv;
+                    }
+                    out << "\n";
+                }
+            }
+        } else {
+            out << "  NULL\n";
+        }
+    }
+
+    // === 3. Deep dump of GMOCOOEIFMK (Player+0x740) ===
+    out << "\n[GMOCOOEIFMK Full Dump (Player+0x740)]\n";
+    {
+        uint64_t gPtr = *(uint64_t *)(rawBase + 0x740);
+        if (gPtr && gPtr > 0x10000 && gPtr < 0x7FFFFFFFFFFF) {
+            auto gObj = reinterpret_cast<Il2CppObject *>(gPtr);
+            if (gObj->klass) {
+                auto n = il2cpp_class_get_name(gObj->klass);
+                auto ns = il2cpp_class_get_namespace(gObj->klass);
+                uint32_t sz = il2cpp_class_instance_size(gObj->klass);
+                out << "  Class: " << (ns && ns[0] ? ns : "") << "::" << (n ? n : "?")
+                    << "  Size: 0x" << std::hex << sz << "\n  Fields:\n";
+                dump_subobject_int32_fields(out, gObj, "    ", curHP, maxHP);
+            }
+        } else {
+            out << "  NULL\n";
+        }
+    }
+
+    // === 4. Disassemble COW value accessor (tail call target from get_CurHP) ===
+    out << "\n[COW Value Accessor Disassembly]\n";
+    {
+        auto code = reinterpret_cast<uint32_t *>(getCurHP->methodPointer);
+        for (int j = 0; j < 40; ++j) {
+            uint32_t insn = code[j];
+            if ((insn & 0xFC000000) == 0x14000000) {
+                int32_t off26 = (int32_t)(insn & 0x3FFFFFF);
+                if (off26 & (1 << 25)) off26 |= ~((1 << 26) - 1);
+                uint64_t target = (uint64_t)&code[j] + ((int64_t)off26 * 4);
+                uint64_t targetRVA = target - il2cpp_base;
+                out << "  B target RVA = 0x" << std::hex << targetRVA << "\n";
+                dump_arm64_instructions(out, reinterpret_cast<void *>(target),
+                                       "COW_ValueAccessor", 80);
+                break;
+            }
+            if ((insn & 0xFFFFFC1F) == 0xD65F0000) break;
+        }
+    }
+
+    // === 5. Remote players: iterate entity list ===
+    out << "\n[Remote Players Scan]\n";
+    if (matchK) {
+        auto cmgField = il2cpp_class_get_field_from_name(facadeK, "CurrentMatchGame");
+        if (cmgField) {
+            auto sd = il2cpp_class_get_static_field_data(facadeK);
+            if (sd) {
+                uint32_t cmgOff = il2cpp_field_get_offset(cmgField);
+                uint64_t matchPtr = *(uint64_t *)((uint8_t *)sd + cmgOff);
+
+                if (matchPtr > 0x10000) {
+                    out << "  MatchGame* = 0x" << std::hex << matchPtr << "\n";
+                    uint64_t listPtr = *(uint64_t *)((uint8_t *)matchPtr + 0xC0);
+
+                    if (listPtr > 0x10000) {
+                        uint64_t arrayPtr = *(uint64_t *)((uint8_t *)listPtr + 0x10);
+                        int32_t count = *(int32_t *)((uint8_t *)listPtr + 0x18);
+                        out << "  Entity count = " << std::dec << count << "\n";
+
+                        int remoteScanned = 0;
+                        if (arrayPtr > 0x10000 && count > 0 && count < 200) {
+                            for (int e = 0; e < count && remoteScanned < 5; ++e) {
+                                uint64_t ePtr = *(uint64_t *)((uint8_t *)arrayPtr + 0x20 + e * 8);
+                                if (!ePtr || ePtr < 0x10000) continue;
+                                if (ePtr == (uint64_t)localPlayer) continue;
+
+                                auto eObj = reinterpret_cast<Il2CppObject *>(ePtr);
+                                if (!eObj->klass) continue;
+                                auto eName = il2cpp_class_get_name(eObj->klass);
+                                if (!eName || strcmp(eName, "Player") != 0) continue;
+
+                                auto rBase = reinterpret_cast<uint8_t *>(ePtr);
+                                uint64_t ptr70 = *(uint64_t *)(rBase + 0x70);
+
+                                int32_t rCurHP = 0, rMaxHP = 0;
+                                {
+                                    Il2CppException *exc = nullptr;
+                                    auto r = il2cpp_runtime_invoke(getCurHP, eObj, nullptr, &exc);
+                                    if (!exc && r) rCurHP = *(int32_t *)il2cpp_object_unbox(r);
+                                }
+                                {
+                                    Il2CppException *exc = nullptr;
+                                    auto r = il2cpp_runtime_invoke(getMaxHP, eObj, nullptr, &exc);
+                                    if (!exc && r) rMaxHP = *(int32_t *)il2cpp_object_unbox(r);
+                                }
+
+                                out << "\n  Remote #" << std::dec << e
+                                    << " @ 0x" << std::hex << ePtr
+                                    << "  CurHP=" << std::dec << rCurHP
+                                    << "  MaxHP=" << rMaxHP
+                                    << "  +0x70=0x" << std::hex << ptr70 << "\n";
+
+                                // Dump Player+0x70 sub-object if non-null
+                                if (ptr70 > 0x10000 && ptr70 < 0x7FFFFFFFFFFF) {
+                                    auto p70Obj = reinterpret_cast<Il2CppObject *>(ptr70);
+                                    if (p70Obj->klass) {
+                                        auto p70Name = il2cpp_class_get_name(p70Obj->klass);
+                                        auto p70Ns = il2cpp_class_get_namespace(p70Obj->klass);
+                                        uint32_t p70Size = il2cpp_class_instance_size(p70Obj->klass);
+                                        out << "    +0x70 -> " << (p70Ns && p70Ns[0] ? p70Ns : "")
+                                            << "::" << (p70Name ? p70Name : "?")
+                                            << " (size=0x" << std::hex << p70Size << ")\n";
+                                        dump_subobject_int32_fields(out, p70Obj, "      ", rCurHP, rMaxHP);
+                                    }
+                                }
+
+                                // Dump remote PlayerAttributes (0x768)
+                                uint64_t rpaPtr = *(uint64_t *)(rBase + 0x768);
+                                if (rpaPtr > 0x10000 && rpaPtr < 0x7FFFFFFFFFFF) {
+                                    auto rpaObj = reinterpret_cast<Il2CppObject *>(rpaPtr);
+                                    if (rpaObj->klass) {
+                                        out << "    PlayerAttributes (+0x768):\n";
+                                        dump_subobject_int32_fields(out, rpaObj, "      ", rCurHP, rMaxHP);
+                                    }
+                                }
+
+                                // Dump remote GMOCOOEIFMK (0x740)
+                                uint64_t rgPtr = *(uint64_t *)(rBase + 0x740);
+                                if (rgPtr > 0x10000 && rgPtr < 0x7FFFFFFFFFFF) {
+                                    auto rgObj = reinterpret_cast<Il2CppObject *>(rgPtr);
+                                    if (rgObj->klass) {
+                                        out << "    GMOCOOEIFMK (+0x740):\n";
+                                        dump_subobject_int32_fields(out, rgObj, "      ", rCurHP, rMaxHP);
+                                    }
+                                }
+
+                                ++remoteScanned;
+                            }
+                        }
+                        if (remoteScanned == 0)
+                            out << "  No remote Players found in entity list\n";
+                    }
+                }
+            }
+        }
+    }
+
+    out.close();
+    LOGI("=== PHASE 4 DONE — %s ===", outPath.c_str());
 }
 
 // ============================================================
