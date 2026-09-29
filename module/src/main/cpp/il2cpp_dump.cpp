@@ -446,6 +446,10 @@ struct GetterTarget {
     const char *label;
 };
 
+// Forward declarations
+static void resolve_offsets_phase2(std::string outDir);
+static void resolve_offsets_phase3(std::string outDir);
+
 // ============================================================
 // Phase 2: Runtime value matching via il2cpp_runtime_invoke
 // Spawns a background thread that waits for a live Player,
