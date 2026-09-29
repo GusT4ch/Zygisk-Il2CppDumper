@@ -2853,14 +2853,14 @@ static void resolve_offsets_phase7(std::string outDir) {
 }
 
 // ============================================================
-// Phase 8: Position resolution (safe — no get_Position invoke)
-// Traces Transform internal native data to find world position.
-// Also dumps all ReplicationData[] floats that look like coords.
+// Phase 8: Position resolution (ultra-safe)
+// Only reads managed IL2CPP objects — NO native pointer chasing.
+// Dumps Transform fields/hex, ReplicationData floats, Player floats.
 // ============================================================
 
 static void resolve_offsets_phase8(std::string outDir) {
     LOGI("=== PHASE 8: Position resolution ===");
-    sleep(28);
+    sleep(35);
 
     auto dom = il2cpp_domain_get();
     if (!dom) { LOGE("Phase8: domain null"); return; }
@@ -2873,8 +2873,7 @@ static void resolve_offsets_phase8(std::string outDir) {
 
     auto facadeK = find_class_all("COW", "GameFacade");
     auto playerK = find_class_all("COW.GamePlay", "Player");
-    auto entityK = find_class_all("GCommon", "Entity");
-    if (!facadeK || !playerK || !entityK) {
+    if (!facadeK || !playerK) {
         out << "Missing classes\n"; out.close(); return;
     }
 
@@ -2910,14 +2909,14 @@ static void resolve_offsets_phase8(std::string outDir) {
 
     auto rawBase = reinterpret_cast<uint8_t *>(localPlayer);
 
-    // === 1. Transform chain: Entity+0x58 ===
-    out << "[1. Transform chain — Entity+0x58]\n";
+    // === 1. Transform info (managed object only, no native chase) ===
+    out << "[1. Transform — Entity+0x58]\n";
     uint64_t cachedTransform = *(uint64_t *)(rawBase + 0x58);
     out << "  m_CachedTransform = 0x" << std::hex << cachedTransform << "\n";
 
-    if (safe_readable((void *)cachedTransform, 0x60)) {
-        auto tBase = reinterpret_cast<uint8_t *>(cachedTransform);
+    if (safe_readable((void *)cachedTransform, 0x40)) {
         auto tObj = reinterpret_cast<Il2CppObject *>(cachedTransform);
+        auto tBase = reinterpret_cast<uint8_t *>(cachedTransform);
         if (tObj->klass) {
             auto tn = il2cpp_class_get_name(tObj->klass);
             auto tns = il2cpp_class_get_namespace(tObj->klass);
@@ -2925,7 +2924,6 @@ static void resolve_offsets_phase8(std::string outDir) {
             out << "  Class: " << (tns && tns[0] ? tns : "") << "::" << (tn ? tn : "?")
                 << " (size=0x" << std::hex << tsz << ")\n";
 
-            // Dump all Transform fields
             out << "  [Fields]\n";
             auto tk = tObj->klass;
             while (tk) {
@@ -2944,98 +2942,23 @@ static void resolve_offsets_phase8(std::string outDir) {
                 tk = il2cpp_class_get_parent(tk);
             }
 
-            // Raw hex dump of Transform
-            out << "  [Raw hex — " << std::dec << tsz << " bytes]\n  ";
-            for (uint32_t i = 0; i < tsz && i < 0x80; ++i) {
-                char hx[4]; snprintf(hx, sizeof(hx), "%02x", tBase[i]);
-                out << hx;
-                if ((i+1) % 8 == 0) out << " ";
-                if ((i+1) % 32 == 0) out << "\n  ";
-            }
-            out << "\n";
-        }
-
-        // Follow every pointer in Transform and dump floats up to 3 levels deep
-        out << "\n  [Pointer chase from Transform — looking for world-space floats]\n";
-        for (uint32_t off = 0x10; off + 8 <= 0x80; off += 8) {
-            if (!safe_readable(tBase + off, 8)) break;
-            uint64_t ptr = *(uint64_t *)(tBase + off);
-            if (!safe_readable((void *)ptr, 0x10)) continue;
-
-            out << "\n  Transform+0x" << std::hex << off << " = 0x" << ptr << "\n";
-
-            // Level 1: dump floats in this block
-            if (safe_readable((void *)ptr, 0x120)) {
-                auto nBase = reinterpret_cast<uint8_t *>(ptr);
-                out << "    L1 floats: ";
-                int printed = 0;
-                for (uint32_t s = 0; s + 4 <= 0x120 && printed < 30; s += 4) {
-                    float fv = *(float *)(nBase + s);
-                    if (fv > 1.0f && fv < 50000.f) {
-                        out << "[+0x" << std::hex << s << "]=" << fv << " ";
-                        ++printed;
-                    }
+            // Raw hex of managed Transform object only
+            uint32_t dumpSz = tsz < 0x60 ? tsz : 0x60;
+            if (safe_readable(tBase, dumpSz)) {
+                out << "  [Raw hex — 0x" << std::hex << dumpSz << " bytes]\n  ";
+                for (uint32_t i = 0; i < dumpSz; ++i) {
+                    char hx[4]; snprintf(hx, sizeof(hx), "%02x", tBase[i]);
+                    out << hx;
+                    if ((i+1) % 8 == 0) out << " ";
+                    if ((i+1) % 32 == 0) out << "\n  ";
                 }
                 out << "\n";
-
-                // Level 2: follow pointers from this block
-                for (uint32_t dp = 0; dp + 8 <= 0x80; dp += 8) {
-                    uint64_t dPtr = *(uint64_t *)(nBase + dp);
-                    if (!safe_readable((void *)dPtr, 0x120)) continue;
-                    auto dBase = reinterpret_cast<uint8_t *>(dPtr);
-
-                    // Check if this has coordinate-like floats
-                    int coordCount = 0;
-                    for (uint32_t s = 0; s + 4 <= 0x120; s += 4) {
-                        float fv = *(float *)(dBase + s);
-                        if (fv > 10.f && fv < 10000.f) ++coordCount;
-                    }
-                    if (coordCount < 2) continue;
-
-                    out << "    L2 Transform+0x" << std::hex << off << "->+0x" << dp
-                        << " = 0x" << dPtr << "\n      floats: ";
-                    printed = 0;
-                    for (uint32_t s = 0; s + 4 <= 0x120 && printed < 30; s += 4) {
-                        float fv = *(float *)(dBase + s);
-                        if (fv > 1.0f && fv < 50000.f) {
-                            out << "[+0x" << std::hex << s << "]=" << fv << " ";
-                            ++printed;
-                        }
-                    }
-                    out << "\n";
-
-                    // Level 3
-                    for (uint32_t dp2 = 0; dp2 + 8 <= 0x80; dp2 += 8) {
-                        uint64_t d2Ptr = *(uint64_t *)(dBase + dp2);
-                        if (!safe_readable((void *)d2Ptr, 0x120)) continue;
-                        auto d2Base = reinterpret_cast<uint8_t *>(d2Ptr);
-                        int cc2 = 0;
-                        for (uint32_t s = 0; s + 4 <= 0x120; s += 4) {
-                            float fv = *(float *)(d2Base + s);
-                            if (fv > 10.f && fv < 10000.f) ++cc2;
-                        }
-                        if (cc2 < 2) continue;
-                        out << "    L3 ...->+0x" << std::hex << dp2
-                            << " = 0x" << d2Ptr << "\n      floats: ";
-                        printed = 0;
-                        for (uint32_t s = 0; s + 4 <= 0x120 && printed < 20; s += 4) {
-                            float fv = *(float *)(d2Base + s);
-                            if (fv > 1.0f && fv < 50000.f) {
-                                out << "[+0x" << std::hex << s << "]=" << fv << " ";
-                                ++printed;
-                            }
-                        }
-                        out << "\n";
-                    }
-                }
             }
         }
-    } else {
-        out << "  (not readable)\n";
     }
 
-    // === 2. Dump ALL ReplicationData[] slots with float interpretation ===
-    out << "\n[2. All ReplicationData[] slots — float values > 10]\n";
+    // === 2. All ReplicationData[] slots with float + int interpretation ===
+    out << "\n[2. ReplicationData[] — all non-zero slots]\n";
     {
         uint64_t priPtr = *(uint64_t *)(rawBase + 0x70);
         if (safe_readable((void *)priPtr, 0x40)) {
@@ -3046,6 +2969,7 @@ static void resolve_offsets_phase8(std::string outDir) {
                 uint64_t arrLen = datasArr->max_length;
                 auto arrData = reinterpret_cast<uint8_t *>(datasArr) + 0x20;
                 uint64_t scanMax = arrLen < 260 ? arrLen : 260;
+                out << "  Array length = " << std::dec << arrLen << "\n";
 
                 for (uint64_t i = 0; i < scanMax; ++i) {
                     uint64_t elemPtr = *(uint64_t *)(arrData + i * 8);
@@ -3055,10 +2979,9 @@ static void resolve_offsets_phase8(std::string outDir) {
                     int32_t ival = *(int32_t *)(eBase + 0x18);
                     float fval = *(float *)(eBase + 0x18);
 
-                    // Print slots with float > 10 (likely coordinates)
-                    // or known important slots (HP=0,1)
-                    if ((fval > 10.f && fval < 50000.f) || i < 5) {
-                        out << "  [" << std::dec << i << "] GroupID=" << groupID
+                    // Print all non-zero slots
+                    if (ival != 0 || i < 5) {
+                        out << "  [" << std::dec << i << "] grp=" << groupID
                             << " int=" << ival << " float=" << fval << "\n";
                     }
                 }
@@ -3066,19 +2989,20 @@ static void resolve_offsets_phase8(std::string outDir) {
         }
     }
 
-    // === 3. Scan raw Player memory for float triplets (position candidates) ===
-    out << "\n[3. Player memory — float triplets that look like world coords]\n";
+    // === 3. Player float triplets that could be world position ===
+    out << "\n[3. Player memory — float triplets (world-coord candidates)]\n";
     {
         uint32_t pSize = il2cpp_class_instance_size(playerK);
-        for (uint32_t off = 0x10; off + 12 <= pSize; off += 4) {
-            float fx = *(float *)(rawBase + off);
-            float fy = *(float *)(rawBase + off + 4);
-            float fz = *(float *)(rawBase + off + 8);
-            // World coords: all 3 between 10 and 10000, at least 2 different
-            if (fx > 10.f && fx < 10000.f && fy > 1.f && fy < 10000.f && fz > 10.f && fz < 10000.f) {
-                if (fx != fy || fy != fz) {
-                    out << "  Player+0x" << std::hex << off
-                        << " = (" << fx << ", " << fy << ", " << fz << ")\n";
+        if (safe_readable(rawBase, pSize)) {
+            for (uint32_t off = 0x10; off + 12 <= pSize; off += 4) {
+                float fx = *(float *)(rawBase + off);
+                float fy = *(float *)(rawBase + off + 4);
+                float fz = *(float *)(rawBase + off + 8);
+                if (fx > 10.f && fx < 10000.f && fy > 1.f && fy < 10000.f && fz > 10.f && fz < 10000.f) {
+                    if (fx != fy || fy != fz) {
+                        out << "  +0x" << std::hex << off
+                            << " = (" << fx << ", " << fy << ", " << fz << ")\n";
+                    }
                 }
             }
         }
