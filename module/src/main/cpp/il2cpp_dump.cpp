@@ -1045,11 +1045,392 @@ static void resolve_offsets(const char *outDir) {
     out.close();
     LOGI("=== OFFSET RESOLVER DONE — %s ===", outPath.c_str());
 
-    // Spawn Phase 2 background thread for runtime value matching
+    // Spawn Phase 2 + Phase 3 background threads
     std::string dirCopy(outDir);
+    std::string dirCopy2(outDir);
     std::thread phase2(resolve_offsets_phase2, dirCopy);
     phase2.detach();
-    LOGI("Phase 2 thread spawned — enter a match to resolve COMPLEX offsets");
+    std::thread phase3(resolve_offsets_phase3, dirCopy2);
+    phase3.detach();
+    LOGI("Phase 2+3 threads spawned — enter a match to resolve offsets");
+}
+
+// ============================================================
+// Phase 3: Deep ARM64 disassembly of COW getters
+// Dumps raw instructions + follows pointer chains to find
+// where CurHP/MaxHP are actually stored (COW replication).
+// Runs after Phase 2 succeeds (has Player*).
+// ============================================================
+
+static const char* arm64_reg_name(int reg) {
+    static char buf[8];
+    if (reg == 31) return "xzr";
+    snprintf(buf, sizeof(buf), "x%d", reg);
+    return buf;
+}
+
+static void dump_arm64_instructions(std::ofstream &out, void *funcPtr, const char *label, int maxInsns = 40) {
+    if (!funcPtr) {
+        out << "[" << label << "] FUNCTION NOT FOUND\n\n";
+        return;
+    }
+
+    auto code = reinterpret_cast<uint32_t *>(funcPtr);
+    out << "[" << label << "] @ " << funcPtr << "\n";
+    out << "  RVA = 0x" << std::hex << ((uint64_t)funcPtr - il2cpp_base) << "\n";
+
+    for (int i = 0; i < maxInsns; ++i) {
+        uint32_t insn = code[i];
+        uint64_t pc = (uint64_t)&code[i];
+
+        out << "  " << std::hex << (pc - il2cpp_base) << ": "
+            << std::hex << insn << "  ";
+
+        uint32_t Rd = insn & 0x1F;
+        uint32_t Rn = (insn >> 5) & 0x1F;
+        uint32_t Rm = (insn >> 16) & 0x1F;
+
+        // RET
+        if ((insn & 0xFFFFFC1F) == 0xD65F0000) {
+            out << "RET\n";
+            break;
+        }
+        // NOP
+        if (insn == 0xD503201F) {
+            out << "NOP\n";
+            continue;
+        }
+        // STP (pre/post index)
+        if ((insn & 0x7FC00000) == 0x29800000 || (insn & 0x7FC00000) == 0xA9800000 ||
+            (insn & 0x7FC00000) == 0x29000000 || (insn & 0x7FC00000) == 0xA9000000) {
+            out << "STP ...\n";
+            continue;
+        }
+        // LDP
+        if ((insn & 0x7FC00000) == 0x29C00000 || (insn & 0x7FC00000) == 0xA9C00000 ||
+            (insn & 0x7FC00000) == 0x29400000 || (insn & 0x7FC00000) == 0xA9400000) {
+            out << "LDP ...\n";
+            continue;
+        }
+        // MOV Xd, Xn (ORR Xd, XZR, Xn)
+        if ((insn & 0xFFE0FFE0) == 0xAA0003E0) {
+            out << "MOV " << arm64_reg_name(Rd) << ", " << arm64_reg_name(Rm) << "\n";
+            continue;
+        }
+        // MOV Wd, Wn (ORR Wd, WZR, Wn)
+        if ((insn & 0xFFE0FFE0) == 0x2A0003E0) {
+            out << "MOV w" << Rd << ", w" << Rm << "\n";
+            continue;
+        }
+        // ADRP
+        if ((insn & 0x9F000000) == 0x90000000) {
+            int64_t immhi = ((int64_t)(insn >> 5) & 0x7FFFF) << 2;
+            int64_t immlo = (insn >> 29) & 0x3;
+            int64_t imm = (immhi | immlo) << 12;
+            if (imm & (1LL << 32)) imm |= ~((1LL << 33) - 1); // sign extend
+            uint64_t target = (pc & ~0xFFF) + imm;
+            out << "ADRP " << arm64_reg_name(Rd)
+                << ", 0x" << std::hex << target << "\n";
+            continue;
+        }
+        // LDR Xt, [Xn, #imm] — 64-bit
+        if ((insn & 0xFFC00000) == 0xF9400000) {
+            uint32_t imm12 = ((insn >> 10) & 0xFFF) * 8;
+            out << "LDR " << arm64_reg_name(Rd)
+                << ", [" << arm64_reg_name(Rn) << ", #0x" << std::hex << imm12 << "]\n";
+            continue;
+        }
+        // LDR Wt, [Xn, #imm] — 32-bit
+        if ((insn & 0xFFC00000) == 0xB9400000) {
+            uint32_t imm12 = ((insn >> 10) & 0xFFF) * 4;
+            out << "LDR w" << Rd
+                << ", [" << arm64_reg_name(Rn) << ", #0x" << std::hex << imm12 << "]\n";
+            continue;
+        }
+        // LDRB Wt, [Xn, #imm]
+        if ((insn & 0xFFC00000) == 0x39400000) {
+            uint32_t imm12 = (insn >> 10) & 0xFFF;
+            out << "LDRB w" << Rd
+                << ", [" << arm64_reg_name(Rn) << ", #0x" << std::hex << imm12 << "]\n";
+            continue;
+        }
+        // LDRH Wt, [Xn, #imm]
+        if ((insn & 0xFFC00000) == 0x79400000) {
+            uint32_t imm12 = ((insn >> 10) & 0xFFF) * 2;
+            out << "LDRH w" << Rd
+                << ", [" << arm64_reg_name(Rn) << ", #0x" << std::hex << imm12 << "]\n";
+            continue;
+        }
+        // LDR St (float), [Xn, #imm]
+        if ((insn & 0xFFC00000) == 0xBD400000) {
+            uint32_t imm12 = ((insn >> 10) & 0xFFF) * 4;
+            out << "LDR s" << Rd
+                << ", [" << arm64_reg_name(Rn) << ", #0x" << std::hex << imm12 << "]\n";
+            continue;
+        }
+        // STR Xt, [Xn, #imm] — 64-bit
+        if ((insn & 0xFFC00000) == 0xF9000000) {
+            uint32_t imm12 = ((insn >> 10) & 0xFFF) * 8;
+            out << "STR " << arm64_reg_name(Rd)
+                << ", [" << arm64_reg_name(Rn) << ", #0x" << std::hex << imm12 << "]\n";
+            continue;
+        }
+        // ADD Xd, Xn, #imm
+        if ((insn & 0xFF000000) == 0x91000000) {
+            uint32_t imm12 = (insn >> 10) & 0xFFF;
+            uint32_t sh = (insn >> 22) & 1;
+            uint32_t val = sh ? (imm12 << 12) : imm12;
+            out << "ADD " << arm64_reg_name(Rd) << ", "
+                << arm64_reg_name(Rn) << ", #0x" << std::hex << val << "\n";
+            continue;
+        }
+        // SUB Xd, Xn, #imm
+        if ((insn & 0xFF000000) == 0xD1000000) {
+            uint32_t imm12 = (insn >> 10) & 0xFFF;
+            out << "SUB " << arm64_reg_name(Rd) << ", "
+                << arm64_reg_name(Rn) << ", #0x" << std::hex << imm12 << "\n";
+            continue;
+        }
+        // CBZ / CBNZ
+        if ((insn & 0x7E000000) == 0x34000000) {
+            int32_t off19 = (int32_t)((insn >> 5) & 0x7FFFF);
+            if (off19 & (1 << 18)) off19 |= ~((1 << 19) - 1);
+            uint64_t target = pc + (off19 * 4);
+            bool nz = (insn >> 24) & 1;
+            out << (nz ? "CBNZ" : "CBZ") << " " << arm64_reg_name(Rd)
+                << ", 0x" << std::hex << (target - il2cpp_base) << "\n";
+            continue;
+        }
+        // TBZ / TBNZ
+        if ((insn & 0x7E000000) == 0x36000000) {
+            uint32_t bit = ((insn >> 31) << 5) | ((insn >> 19) & 0x1F);
+            int32_t off14 = (int32_t)((insn >> 5) & 0x3FFF);
+            if (off14 & (1 << 13)) off14 |= ~((1 << 14) - 1);
+            uint64_t target = pc + (off14 * 4);
+            bool nz = (insn >> 24) & 1;
+            out << (nz ? "TBNZ" : "TBZ") << " " << arm64_reg_name(Rd)
+                << ", #" << std::dec << bit
+                << ", 0x" << std::hex << (target - il2cpp_base) << "\n";
+            continue;
+        }
+        // B (unconditional)
+        if ((insn & 0xFC000000) == 0x14000000) {
+            int32_t off26 = (int32_t)(insn & 0x3FFFFFF);
+            if (off26 & (1 << 25)) off26 |= ~((1 << 26) - 1);
+            uint64_t target = pc + (off26 * 4);
+            out << "B 0x" << std::hex << (target - il2cpp_base) << "\n";
+            continue;
+        }
+        // BL (branch with link)
+        if ((insn & 0xFC000000) == 0x94000000) {
+            int32_t off26 = (int32_t)(insn & 0x3FFFFFF);
+            if (off26 & (1 << 25)) off26 |= ~((1 << 26) - 1);
+            uint64_t target = pc + (off26 * 4);
+            out << "BL 0x" << std::hex << (target - il2cpp_base) << "\n";
+            continue;
+        }
+        // BR (branch to register)
+        if ((insn & 0xFFFFFC00) == 0xD61F0000) {
+            out << "BR " << arm64_reg_name(Rn) << "\n";
+            continue;
+        }
+        // B.cond
+        if ((insn & 0xFF000010) == 0x54000000) {
+            int32_t off19 = (int32_t)((insn >> 5) & 0x7FFFF);
+            if (off19 & (1 << 18)) off19 |= ~((1 << 19) - 1);
+            uint64_t target = pc + (off19 * 4);
+            uint32_t cond = insn & 0xF;
+            const char* condNames[] = {"eq","ne","cs","cc","mi","pl","vs","vc",
+                                        "hi","ls","ge","lt","gt","le","al","nv"};
+            out << "B." << condNames[cond]
+                << " 0x" << std::hex << (target - il2cpp_base) << "\n";
+            continue;
+        }
+        // CMP (SUBS xzr, Xn, #imm)
+        if ((insn & 0xFF00001F) == 0xF100001F) {
+            uint32_t imm12 = (insn >> 10) & 0xFFF;
+            out << "CMP " << arm64_reg_name(Rn) << ", #0x" << std::hex << imm12 << "\n";
+            continue;
+        }
+        // Unknown
+        out << "??? (0x" << std::hex << insn << ")\n";
+    }
+    out << "\n";
+}
+
+static void resolve_offsets_phase3(std::string outDir) {
+    LOGI("=== PHASE 3: ARM64 deep disassembly of HP getters ===");
+
+    sleep(5);
+
+    auto dom = il2cpp_domain_get();
+    if (!dom) { LOGE("Phase3: domain null"); return; }
+    auto thr = il2cpp_thread_attach(dom);
+    if (!thr) { LOGE("Phase3: thread attach fail"); return; }
+
+    auto outPath = outDir + "/files/getter_disasm.txt";
+    std::ofstream out(outPath);
+    if (!out.is_open()) {
+        LOGE("Phase3: Cannot open %s", outPath.c_str());
+        return;
+    }
+
+    out << "// =============================================\n"
+        << "// Phantom Phase 3 — ARM64 Getter Disassembly\n"
+        << "// il2cpp_base = 0x" << std::hex << il2cpp_base << "\n"
+        << "// =============================================\n\n";
+
+    // Getters to disassemble
+    struct DisasmTarget {
+        const char *ns;
+        const char *cls;
+        const char *method;
+        const char *label;
+    };
+
+    DisasmTarget targets[] = {
+        {"COW.GamePlay", "Player", "get_CurHP",          "Player::get_CurHP"},
+        {"COW.GamePlay", "Player", "get_MaxHP",          "Player::get_MaxHP"},
+        {"COW.GamePlay", "Player", "get_CurEP",          "Player::get_CurEP"},
+        {"COW.GamePlay", "Player", "get_CurAP",          "Player::get_CurAP"},
+        {"COW.GamePlay", "Player", "get_OriginalMaxHP",  "Player::get_OriginalMaxHP"},
+        {"COW.GamePlay", "Player", "get_TeamIndex",      "Player::get_TeamIndex"},
+        {"GCommon",      "Entity", "get_Position",       "Entity::get_Position"},
+    };
+
+    int numTargets = sizeof(targets) / sizeof(targets[0]);
+
+    for (int i = 0; i < numTargets; ++i) {
+        auto klass = find_class_all(targets[i].ns, targets[i].cls);
+        if (!klass) {
+            out << "[" << targets[i].label << "] CLASS NOT FOUND\n\n";
+            continue;
+        }
+
+        auto mi = il2cpp_class_get_method_from_name(klass, targets[i].method, 0);
+        if (!mi || !mi->methodPointer) {
+            out << "[" << targets[i].label << "] METHOD NOT FOUND\n\n";
+            continue;
+        }
+
+        dump_arm64_instructions(out, mi->methodPointer, targets[i].label);
+
+        // If getter calls a subroutine (BL), also disassemble that target
+        auto code = reinterpret_cast<uint32_t *>(mi->methodPointer);
+        for (int j = 0; j < 20; ++j) {
+            uint32_t insn = code[j];
+            // BL instruction
+            if ((insn & 0xFC000000) == 0x94000000) {
+                int32_t off26 = (int32_t)(insn & 0x3FFFFFF);
+                if (off26 & (1 << 25)) off26 |= ~((1 << 26) - 1);
+                uint64_t target = (uint64_t)&code[j] + (off26 * 4);
+
+                char subLabel[128];
+                snprintf(subLabel, sizeof(subLabel), "%s -> BL target (sub_%llX)",
+                         targets[i].label, (unsigned long long)(target - il2cpp_base));
+
+                dump_arm64_instructions(out, reinterpret_cast<void *>(target), subLabel, 30);
+                break; // only follow first BL
+            }
+            // RET — stop looking
+            if ((insn & 0xFFFFFC1F) == 0xD65F0000) break;
+        }
+    }
+
+    // Also dump the runtime Player* read test
+    auto facadeK = find_class_all("COW", "GameFacade");
+    if (facadeK) {
+        auto clpMethod = il2cpp_class_get_method_from_name(facadeK, "CurrentLocalPlayer", 0);
+        if (clpMethod && clpMethod->methodPointer) {
+            // Try to get Player and read from indirected offset
+            Il2CppObject *localPlayer = nullptr;
+            for (int attempt = 0; attempt < 60; ++attempt) {
+                Il2CppException *exc = nullptr;
+                auto result = il2cpp_runtime_invoke(clpMethod, nullptr, nullptr, &exc);
+                if (!exc && result) {
+                    localPlayer = result;
+                    break;
+                }
+                sleep(5);
+            }
+
+            if (localPlayer) {
+                out << "[Runtime Player* Test]\n";
+                out << "  Player* = 0x" << std::hex << (uint64_t)localPlayer << "\n";
+
+                auto rawBase = reinterpret_cast<uint8_t *>(localPlayer);
+
+                // Dump first 0x300 bytes as hex for analysis
+                out << "\n[Player Raw Memory Dump (first 0x300 bytes)]\n";
+                for (uint32_t off = 0; off < 0x300; off += 0x10) {
+                    out << "  +" << std::hex << off << ": ";
+                    for (int b = 0; b < 16; ++b) {
+                        uint8_t val = rawBase[off + b];
+                        char hex[4];
+                        snprintf(hex, sizeof(hex), "%02X ", val);
+                        out << hex;
+                    }
+                    out << "\n";
+                }
+
+                // Dump specific pointer fields that might be COW component
+                out << "\n[Pointer Fields Scan — looking for COW component]\n";
+                auto playerK = find_class_all("COW.GamePlay", "Player");
+                if (playerK) {
+                    uint32_t pSize = il2cpp_class_instance_size(playerK);
+                    void *iter = nullptr;
+                    while (auto f = il2cpp_class_get_fields(playerK, &iter)) {
+                        auto flags = il2cpp_field_get_flags(f);
+                        if (flags & FIELD_ATTRIBUTE_STATIC) continue;
+                        auto ftype = il2cpp_field_get_type(f);
+                        int typeEnum = il2cpp_type_get_type(ftype);
+                        // Only CLASS/OBJECT fields (pointers to other objects)
+                        if (typeEnum != IL2CPP_TYPE_CLASS && typeEnum != IL2CPP_TYPE_OBJECT) continue;
+                        uint32_t off = il2cpp_field_get_offset(f);
+                        if (off + 8 > pSize) continue;
+                        uint64_t ptr = *(uint64_t *)(rawBase + off);
+                        if (ptr == 0) continue;
+
+                        auto fname = il2cpp_field_get_name(f);
+                        out << "  0x" << std::hex << off << " " << fname
+                            << " = 0x" << ptr;
+
+                        // Try to identify the class of the pointed object
+                        if (ptr > 0x10000 && ptr < 0x7FFFFFFFFFFF) {
+                            auto obj = reinterpret_cast<Il2CppObject *>(ptr);
+                            if (obj->klass) {
+                                auto kName = il2cpp_class_get_name(obj->klass);
+                                auto kNs = il2cpp_class_get_namespace(obj->klass);
+                                if (kName) {
+                                    out << " -> " << (kNs ? kNs : "") << "::" << kName;
+
+                                    // If it's a potential health component, try reading Int32 fields from it
+                                    uint32_t subSize = il2cpp_class_instance_size(obj->klass);
+                                    if (subSize > 16 && subSize < 0x200) {
+                                        auto subBase = reinterpret_cast<uint8_t *>(ptr);
+                                        out << " (size=0x" << std::hex << subSize << ")";
+                                        // Scan for value 200 (default MaxHP) in this sub-object
+                                        for (uint32_t sOff = 0x10; sOff + 4 <= subSize; sOff += 4) {
+                                            int32_t sVal = *(int32_t *)(subBase + sOff);
+                                            if (sVal >= 50 && sVal <= 300) {
+                                                out << " [+" << std::hex << sOff << "=" << std::dec << sVal << "]";
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        out << "\n";
+                    }
+                }
+            } else {
+                out << "[Runtime Player* Test] FAILED — no player found (not in match)\n";
+            }
+        }
+    }
+
+    out.close();
+    LOGI("=== PHASE 3 DONE — %s ===", outPath.c_str());
 }
 
 // ============================================================
