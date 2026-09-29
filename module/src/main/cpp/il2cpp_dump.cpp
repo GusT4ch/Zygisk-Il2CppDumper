@@ -2158,7 +2158,7 @@ static void resolve_offsets_phase5(std::string outDir) {
             if (!image) continue;
             auto classCount = il2cpp_image_get_class_count(image);
             for (size_t j = 0; j < classCount; ++j) {
-                auto klass = il2cpp_image_get_class(image, j);
+                auto klass = const_cast<Il2CppClass *>(il2cpp_image_get_class(image, j));
                 if (!klass) continue;
                 uint32_t token = il2cpp_class_get_type_token(klass);
                 if (token == 0x23D4 || token == 0x23D5 ||
