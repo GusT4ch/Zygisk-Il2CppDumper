@@ -1317,7 +1317,7 @@ static void resolve_offsets_phase3(std::string outDir) {
             continue;
         }
 
-        dump_arm64_instructions(out, mi->methodPointer, targets[i].label);
+        dump_arm64_instructions(out, reinterpret_cast<void *>(mi->methodPointer), targets[i].label);
 
         // If getter calls a subroutine (BL), also disassemble that target
         auto code = reinterpret_cast<uint32_t *>(mi->methodPointer);
