@@ -454,6 +454,7 @@ static void resolve_offsets_phase4(std::string outDir);
 static void resolve_offsets_phase5(std::string outDir);
 static void resolve_offsets_phase6(std::string outDir);
 static void resolve_offsets_phase7(std::string outDir);
+static void resolve_offsets_phase8(std::string outDir);
 
 // ============================================================
 // Phase 2: Runtime value matching via il2cpp_runtime_invoke
@@ -1073,7 +1074,10 @@ static void resolve_offsets(const char *outDir) {
     std::string dirCopy6(outDir);
     std::thread phase7(resolve_offsets_phase7, dirCopy6);
     phase7.detach();
-    LOGI("Phase 2-7 threads spawned — enter a match to resolve offsets");
+    std::string dirCopy7(outDir);
+    std::thread phase8(resolve_offsets_phase8, dirCopy7);
+    phase8.detach();
+    LOGI("Phase 2-8 threads spawned — enter a match to resolve offsets");
 }
 
 // ============================================================
@@ -2846,6 +2850,347 @@ static void resolve_offsets_phase7(std::string outDir) {
 
     out.close();
     LOGI("=== PHASE 7 DONE — %s ===", outPath.c_str());
+}
+
+// ============================================================
+// Phase 8: Position resolution
+// Calls Entity.get_Position() to get actual coordinates, then
+// traces Transform internal data and scans ReplicationData[]
+// to find where position is stored for external reading.
+// ============================================================
+
+static void resolve_offsets_phase8(std::string outDir) {
+    LOGI("=== PHASE 8: Position resolution ===");
+    sleep(28);
+
+    auto dom = il2cpp_domain_get();
+    if (!dom) { LOGE("Phase8: domain null"); return; }
+    auto thr = il2cpp_thread_attach(dom);
+    if (!thr) { LOGE("Phase8: thread attach fail"); return; }
+
+    auto outPath = outDir + "/files/position_trace.txt";
+    std::ofstream out(outPath);
+    if (!out.is_open()) { LOGE("Phase8: Cannot open %s", outPath.c_str()); return; }
+
+    auto facadeK = find_class_all("COW", "GameFacade");
+    auto playerK = find_class_all("COW.GamePlay", "Player");
+    auto entityK = find_class_all("GCommon", "Entity");
+    if (!facadeK || !playerK || !entityK) {
+        out << "Missing classes\n"; out.close(); return;
+    }
+
+    auto clpMethod = il2cpp_class_get_method_from_name(facadeK, "CurrentLocalPlayer", 0);
+    auto getCurHP  = il2cpp_class_get_method_from_name(playerK, "get_CurHP", 0);
+    if (!clpMethod || !getCurHP) {
+        out << "Missing methods\n"; out.close(); return;
+    }
+
+    // get_Position is on Entity (parent of Player)
+    auto getPosMethod = il2cpp_class_get_method_from_name(entityK, "get_Position", 0);
+
+    Il2CppObject *localPlayer = nullptr;
+    int32_t curHP = 0;
+    for (int attempt = 0; attempt < 180; ++attempt) {
+        Il2CppException *exc = nullptr;
+        auto r = il2cpp_runtime_invoke(clpMethod, nullptr, nullptr, &exc);
+        if (!exc && r) {
+            localPlayer = r;
+            exc = nullptr;
+            auto rH = il2cpp_runtime_invoke(getCurHP, localPlayer, nullptr, &exc);
+            if (!exc && rH) curHP = *(int32_t *)il2cpp_object_unbox(rH);
+            if (curHP > 0) break;
+        }
+        sleep(3);
+    }
+    if (!localPlayer || curHP <= 0) {
+        out << "Phase8: Player not alive\n"; out.close(); return;
+    }
+
+    out << "// =============================================\n"
+        << "// Phantom Phase 8 — Position Resolution\n"
+        << "// =============================================\n\n"
+        << "Player* = 0x" << std::hex << (uint64_t)localPlayer << "\n"
+        << "CurHP = " << std::dec << curHP << "\n\n";
+
+    auto rawBase = reinterpret_cast<uint8_t *>(localPlayer);
+
+    // === 1. Call get_Position() to get actual coordinates ===
+    float posX = 0, posY = 0, posZ = 0;
+    bool gotPosition = false;
+
+    if (getPosMethod) {
+        out << "[1. get_Position() via runtime invoke]\n";
+        out << "  Method RVA = 0x" << std::hex
+            << ((uint64_t)getPosMethod->methodPointer - il2cpp_base) << "\n";
+
+        // get_Position returns Vector3 (value type)
+        // For value-type returns, IL2CPP may need a different invocation pattern
+        // Try direct invoke first
+        Il2CppException *exc = nullptr;
+        auto posResult = il2cpp_runtime_invoke(getPosMethod, localPlayer, nullptr, &exc);
+        if (exc) {
+            out << "  Exception thrown\n";
+        } else if (posResult) {
+            // Vector3 is 12 bytes: float x, y, z
+            auto unboxed = il2cpp_object_unbox(posResult);
+            if (unboxed) {
+                float *fvals = (float *)unboxed;
+                posX = fvals[0];
+                posY = fvals[1];
+                posZ = fvals[2];
+                gotPosition = true;
+                out << "  Position = (" << posX << ", " << posY << ", " << posZ << ")\n";
+            }
+        } else {
+            out << "  Returned null\n";
+        }
+    } else {
+        out << "[1. get_Position NOT FOUND on Entity]\n";
+        // Try on Player class directly
+        auto getPosPlayer = il2cpp_class_get_method_from_name(playerK, "get_Position", 0);
+        if (getPosPlayer) {
+            out << "  Found on Player instead, RVA = 0x" << std::hex
+                << ((uint64_t)getPosPlayer->methodPointer - il2cpp_base) << "\n";
+            Il2CppException *exc = nullptr;
+            auto posResult = il2cpp_runtime_invoke(getPosPlayer, localPlayer, nullptr, &exc);
+            if (!exc && posResult) {
+                auto unboxed = il2cpp_object_unbox(posResult);
+                if (unboxed) {
+                    float *fvals = (float *)unboxed;
+                    posX = fvals[0];
+                    posY = fvals[1];
+                    posZ = fvals[2];
+                    gotPosition = true;
+                    out << "  Position = (" << posX << ", " << posY << ", " << posZ << ")\n";
+                }
+            } else {
+                out << "  Exception or null\n";
+            }
+        } else {
+            out << "  Not found on Player either\n";
+        }
+    }
+
+    // === 2. Trace Transform chain: Entity+0x58 → Transform internals ===
+    out << "\n[2. Transform chain — Entity+0x58]\n";
+    uint64_t cachedTransform = *(uint64_t *)(rawBase + 0x58);
+    out << "  m_CachedTransform = 0x" << std::hex << cachedTransform << "\n";
+
+    if (safe_readable((void *)cachedTransform, 0x60)) {
+        auto tBase = reinterpret_cast<uint8_t *>(cachedTransform);
+        auto tObj = reinterpret_cast<Il2CppObject *>(cachedTransform);
+        if (tObj->klass) {
+            auto tn = il2cpp_class_get_name(tObj->klass);
+            auto tns = il2cpp_class_get_namespace(tObj->klass);
+            uint32_t tsz = il2cpp_class_instance_size(tObj->klass);
+            out << "  Class: " << (tns && tns[0] ? tns : "") << "::" << (tn ? tn : "?")
+                << " (size=0x" << std::hex << tsz << ")\n";
+
+            // Dump Transform fields
+            out << "  [Transform fields]\n";
+            auto tk = tObj->klass;
+            while (tk) {
+                auto kn = il2cpp_class_get_name(tk);
+                if (!kn || strcmp(kn, "Object") == 0) break;
+                void *iter = nullptr;
+                while (auto f = il2cpp_class_get_fields(tk, &iter)) {
+                    auto fflags = il2cpp_field_get_flags(f);
+                    if (fflags & FIELD_ATTRIBUTE_STATIC) continue;
+                    auto fname = il2cpp_field_get_name(f);
+                    uint32_t foff = il2cpp_field_get_offset(f);
+                    auto ftype = il2cpp_field_get_type(f);
+                    auto fcls = il2cpp_class_from_type(ftype);
+                    auto ftname = fcls ? il2cpp_class_get_name(fcls) : "?";
+                    out << "    0x" << std::hex << foff << " " << ftname << " " << fname << "\n";
+                }
+                tk = il2cpp_class_get_parent(tk);
+            }
+        }
+
+        // Follow every 8-byte pointer in Transform looking for internal data
+        out << "\n  [Following pointers in Transform]\n";
+        for (uint32_t off = 0x10; off + 8 <= 0x60; off += 8) {
+            uint64_t ptr = *(uint64_t *)(tBase + off);
+            if (!safe_readable((void *)ptr, 0x10)) continue;
+
+            out << "  +0x" << std::hex << off << " = 0x" << ptr;
+
+            // Check if it's a managed object
+            auto pObj = reinterpret_cast<Il2CppObject *>(ptr);
+            bool isManagedObj = false;
+            if (safe_readable(pObj, sizeof(Il2CppObject)) && safe_readable(pObj->klass, 0x10)) {
+                auto pn = il2cpp_class_get_name(pObj->klass);
+                if (pn && strlen(pn) > 0 && strlen(pn) < 200) {
+                    out << " -> " << pn;
+                    isManagedObj = true;
+                }
+            }
+
+            // If not a managed object, try reading as native Transform data
+            if (!isManagedObj && safe_readable((void *)ptr, 0x100)) {
+                auto nBase = reinterpret_cast<uint8_t *>(ptr);
+                // Scan for position floats in the native data
+                out << " (native data)";
+                bool foundPos = false;
+                if (gotPosition) {
+                    for (uint32_t s = 0; s + 12 <= 0x100; s += 4) {
+                        float fx = *(float *)(nBase + s);
+                        float fy = *(float *)(nBase + s + 4);
+                        float fz = *(float *)(nBase + s + 8);
+                        if (fabsf(fx - posX) < 0.5f && fabsf(fy - posY) < 0.5f && fabsf(fz - posZ) < 0.5f) {
+                            out << "\n    *** POSITION MATCH at native+0x" << std::hex << s
+                                << " = (" << fx << ", " << fy << ", " << fz << ") ***";
+                            foundPos = true;
+                        }
+                    }
+                }
+                if (!foundPos) {
+                    // Dump some floats for manual analysis
+                    out << "\n    Floats: ";
+                    for (uint32_t s = 0; s + 4 <= 0xC0; s += 4) {
+                        float fv = *(float *)(nBase + s);
+                        if (fv > 0.001f && fv < 100000.f) {
+                            out << "[+0x" << std::hex << s << "]=" << fv << " ";
+                        }
+                    }
+                }
+            }
+            out << "\n";
+        }
+
+        // Deep follow: Transform+0x10 is often the native internal pointer on Unity/IL2CPP
+        // Also try +0x38, +0x48 which are common on different Unity versions
+        out << "\n  [Deep native data scan — common Unity offsets]\n";
+        uint32_t tryOffsets[] = {0x10, 0x18, 0x38, 0x40, 0x48};
+        for (auto tOff : tryOffsets) {
+            if (tOff + 8 > 0x60) continue;
+            uint64_t nPtr = *(uint64_t *)(tBase + tOff);
+            if (!safe_readable((void *)nPtr, 0x100)) continue;
+
+            auto nBase = reinterpret_cast<uint8_t *>(nPtr);
+            out << "  Transform+0x" << std::hex << tOff << " -> 0x" << nPtr << "\n";
+
+            if (gotPosition) {
+                for (uint32_t s = 0; s + 12 <= 0x100; s += 4) {
+                    float fx = *(float *)(nBase + s);
+                    float fy = *(float *)(nBase + s + 4);
+                    float fz = *(float *)(nBase + s + 8);
+                    if (fabsf(fx - posX) < 0.5f && fabsf(fy - posY) < 0.5f && fabsf(fz - posZ) < 0.5f) {
+                        out << "    *** POSITION at +0x" << std::hex << s
+                            << " = (" << fx << ", " << fy << ", " << fz << ") ***\n";
+                    }
+                }
+
+                // Also follow one more level deep
+                for (uint32_t dp = 0; dp + 8 <= 0x60; dp += 8) {
+                    uint64_t dPtr = *(uint64_t *)(nBase + dp);
+                    if (!safe_readable((void *)dPtr, 0x100)) continue;
+                    auto dBase = reinterpret_cast<uint8_t *>(dPtr);
+                    for (uint32_t s = 0; s + 12 <= 0x100; s += 4) {
+                        float fx = *(float *)(dBase + s);
+                        float fy = *(float *)(dBase + s + 4);
+                        float fz = *(float *)(dBase + s + 8);
+                        if (fabsf(fx - posX) < 0.5f && fabsf(fy - posY) < 0.5f && fabsf(fz - posZ) < 0.5f) {
+                            out << "    *** POSITION at Transform+0x" << std::hex << tOff
+                                << "->+0x" << dp << "->+0x" << s
+                                << " = (" << fx << ", " << fy << ", " << fz << ") ***\n";
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        out << "  (not readable)\n";
+    }
+
+    // === 3. Scan ReplicationData[] for position floats ===
+    out << "\n[3. ReplicationData[] float scan for position]\n";
+    if (gotPosition) {
+        uint64_t priPtr = *(uint64_t *)(rawBase + 0x70);
+        if (safe_readable((void *)priPtr, 0x40)) {
+            auto priBase = reinterpret_cast<uint8_t *>(priPtr);
+            uint64_t datasPtr = *(uint64_t *)(priBase + 0x10);
+            if (safe_readable((void *)datasPtr, 0x20)) {
+                auto datasArr = reinterpret_cast<Il2CppArray *>(datasPtr);
+                uint64_t arrLen = datasArr->max_length;
+                auto arrData = reinterpret_cast<uint8_t *>(datasArr) + 0x20;
+                uint64_t scanMax = arrLen < 260 ? arrLen : 260;
+
+                for (uint64_t i = 0; i < scanMax; ++i) {
+                    uint64_t elemPtr = *(uint64_t *)(arrData + i * 8);
+                    if (!elemPtr || !safe_readable((void *)elemPtr, 0x20)) continue;
+                    auto eBase = reinterpret_cast<uint8_t *>(elemPtr);
+
+                    // Value is at +0x18 (ReplicationDataValueUnion)
+                    // Could be int32 or float — try as float
+                    float fval = *(float *)(eBase + 0x18);
+                    int32_t ival = *(int32_t *)(eBase + 0x18);
+
+                    if (fabsf(fval - posX) < 1.0f || fabsf(fval - posY) < 1.0f || fabsf(fval - posZ) < 1.0f) {
+                        int32_t groupID = *(int32_t *)(eBase + 0x10);
+                        out << "  m_Datas[" << std::dec << i << "] GroupID=" << groupID
+                            << " float=" << fval << " int=" << ival;
+                        if (fabsf(fval - posX) < 1.0f) out << " *** ~posX ***";
+                        if (fabsf(fval - posY) < 1.0f) out << " *** ~posY ***";
+                        if (fabsf(fval - posZ) < 1.0f) out << " *** ~posZ ***";
+                        out << "\n";
+                    }
+                }
+            }
+        }
+        out << "  (scan complete)\n";
+    } else {
+        out << "  (skipped — position not obtained from getter)\n";
+    }
+
+    // === 4. Dump first 20 ReplicationData slots with float interpretation ===
+    out << "\n[4. First 20 ReplicationData slots — int32 and float]\n";
+    {
+        uint64_t priPtr = *(uint64_t *)(rawBase + 0x70);
+        if (safe_readable((void *)priPtr, 0x40)) {
+            auto priBase = reinterpret_cast<uint8_t *>(priPtr);
+            uint64_t datasPtr = *(uint64_t *)(priBase + 0x10);
+            if (safe_readable((void *)datasPtr, 0x20)) {
+                auto datasArr = reinterpret_cast<Il2CppArray *>(datasPtr);
+                auto arrData = reinterpret_cast<uint8_t *>(datasArr) + 0x20;
+
+                for (int i = 0; i < 20; ++i) {
+                    uint64_t elemPtr = *(uint64_t *)(arrData + i * 8);
+                    if (!elemPtr || !safe_readable((void *)elemPtr, 0x20)) {
+                        out << "  [" << i << "] null\n";
+                        continue;
+                    }
+                    auto eBase = reinterpret_cast<uint8_t *>(elemPtr);
+                    int32_t groupID = *(int32_t *)(eBase + 0x10);
+                    int32_t ival = *(int32_t *)(eBase + 0x18);
+                    float fval = *(float *)(eBase + 0x18);
+                    int32_t ival2 = *(int32_t *)(eBase + 0x1C);
+                    float fval2 = *(float *)(eBase + 0x1C);
+                    out << "  [" << std::dec << i << "] GroupID=" << groupID
+                        << "  lo32: int=" << ival << " float=" << fval
+                        << "  hi32: int=" << ival2 << " float=" << fval2 << "\n";
+                }
+            }
+        }
+    }
+
+    // === 5. Scan raw Player memory for position floats ===
+    if (gotPosition) {
+        out << "\n[5. Raw Player scan for position floats]\n";
+        uint32_t pSize = il2cpp_class_instance_size(playerK);
+        for (uint32_t off = 0x10; off + 12 <= pSize; off += 4) {
+            float fx = *(float *)(rawBase + off);
+            float fy = *(float *)(rawBase + off + 4);
+            float fz = *(float *)(rawBase + off + 8);
+            if (fabsf(fx - posX) < 1.0f && fabsf(fy - posY) < 1.0f && fabsf(fz - posZ) < 1.0f) {
+                out << "  Player+0x" << std::hex << off
+                    << " = (" << fx << ", " << fy << ", " << fz << ") *** MATCH ***\n";
+            }
+        }
+    }
+
+    out.close();
+    LOGI("=== PHASE 8 DONE — %s ===", outPath.c_str());
 }
 
 // ============================================================
