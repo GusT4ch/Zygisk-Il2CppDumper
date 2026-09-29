@@ -450,6 +450,7 @@ struct GetterTarget {
 static void resolve_offsets_phase2(std::string outDir);
 static void resolve_offsets_phase3(std::string outDir);
 static void resolve_offsets_phase4(std::string outDir);
+static void resolve_offsets_phase5(std::string outDir);
 
 // ============================================================
 // Phase 2: Runtime value matching via il2cpp_runtime_invoke
@@ -1060,7 +1061,10 @@ static void resolve_offsets(const char *outDir) {
     std::string dirCopy3(outDir);
     std::thread phase4(resolve_offsets_phase4, dirCopy3);
     phase4.detach();
-    LOGI("Phase 2+3+4 threads spawned — enter a match to resolve offsets");
+    std::string dirCopy4(outDir);
+    std::thread phase5(resolve_offsets_phase5, dirCopy4);
+    phase5.detach();
+    LOGI("Phase 2-5 threads spawned — enter a match to resolve offsets");
 }
 
 // ============================================================
@@ -1827,6 +1831,366 @@ static void resolve_offsets_phase4(std::string outDir) {
 
     out.close();
     LOGI("=== PHASE 4 DONE — %s ===", outPath.c_str());
+}
+
+// ============================================================
+// Phase 5: COW component tracing + entity list fix
+// Traces the actual COW component object returned by interface
+// dispatch, dumps its data buffer, and fixes entity iteration.
+// ============================================================
+
+static void resolve_offsets_phase5(std::string outDir) {
+    LOGI("=== PHASE 5: COW component trace ===");
+    sleep(15);
+
+    auto dom = il2cpp_domain_get();
+    if (!dom) { LOGE("Phase5: domain null"); return; }
+    auto thr = il2cpp_thread_attach(dom);
+    if (!thr) { LOGE("Phase5: thread attach fail"); return; }
+
+    auto outPath = outDir + "/files/cow_trace.txt";
+    std::ofstream out(outPath);
+    if (!out.is_open()) { LOGE("Phase5: Cannot open %s", outPath.c_str()); return; }
+
+    auto facadeK = find_class_all("COW", "GameFacade");
+    auto playerK = find_class_all("COW.GamePlay", "Player");
+    auto matchK  = find_class_all("COW", "MatchGame");
+    if (!facadeK || !playerK) { out << "Missing classes\n"; out.close(); return; }
+
+    auto clpMethod = il2cpp_class_get_method_from_name(facadeK, "CurrentLocalPlayer", 0);
+    auto getCurHP  = il2cpp_class_get_method_from_name(playerK, "get_CurHP", 0);
+    auto getMaxHP  = il2cpp_class_get_method_from_name(playerK, "get_MaxHP", 0);
+    if (!clpMethod || !getCurHP || !getMaxHP) { out << "Missing methods\n"; out.close(); return; }
+
+    // Wait for alive player
+    Il2CppObject *localPlayer = nullptr;
+    int32_t curHP = 0, maxHP = 0;
+    for (int attempt = 0; attempt < 180; ++attempt) {
+        Il2CppException *exc = nullptr;
+        auto r = il2cpp_runtime_invoke(clpMethod, nullptr, nullptr, &exc);
+        if (!exc && r) {
+            localPlayer = r;
+            exc = nullptr;
+            auto rH = il2cpp_runtime_invoke(getCurHP, localPlayer, nullptr, &exc);
+            if (!exc && rH) curHP = *(int32_t *)il2cpp_object_unbox(rH);
+            exc = nullptr;
+            auto rM = il2cpp_runtime_invoke(getMaxHP, localPlayer, nullptr, &exc);
+            if (!exc && rM) maxHP = *(int32_t *)il2cpp_object_unbox(rM);
+            if (curHP > 0 && maxHP > 0) break;
+        }
+        sleep(3);
+    }
+    if (!localPlayer || curHP <= 0) {
+        out << "Phase5: Player not alive\n"; out.close(); return;
+    }
+
+    out << "// =============================================\n"
+        << "// Phantom Phase 5 — COW Component Trace\n"
+        << "// =============================================\n\n"
+        << "Player* = 0x" << std::hex << (uint64_t)localPlayer << "\n"
+        << "CurHP = " << std::dec << curHP << "  MaxHP = " << maxHP << "\n\n";
+
+    // === 1. Enumerate MatchGame fields to find entity collection ===
+    out << "[MatchGame Fields]\n";
+    if (matchK) {
+        uint32_t mSize = il2cpp_class_instance_size(matchK);
+        out << "  InstanceSize = 0x" << std::hex << mSize << "\n";
+
+        auto cmgField = il2cpp_class_get_field_from_name(facadeK, "CurrentMatchGame");
+        Il2CppObject *matchObj = nullptr;
+        if (cmgField) {
+            auto sd = il2cpp_class_get_static_field_data(facadeK);
+            if (sd) {
+                uint32_t cmgOff = il2cpp_field_get_offset(cmgField);
+                uint64_t mPtr = *(uint64_t *)((uint8_t *)sd + cmgOff);
+                if (mPtr > 0x10000) matchObj = reinterpret_cast<Il2CppObject *>(mPtr);
+            }
+        }
+
+        if (matchObj) {
+            out << "  MatchGame* = 0x" << std::hex << (uint64_t)matchObj << "\n";
+            auto mBase = reinterpret_cast<uint8_t *>(matchObj);
+
+            void *iter = nullptr;
+            while (auto f = il2cpp_class_get_fields(matchK, &iter)) {
+                auto flags = il2cpp_field_get_flags(f);
+                if (flags & FIELD_ATTRIBUTE_STATIC) continue;
+                auto ftype = il2cpp_field_get_type(f);
+                int typeEnum = il2cpp_type_get_type(ftype);
+                auto fname = il2cpp_field_get_name(f);
+                uint32_t foff = il2cpp_field_get_offset(f);
+                auto fcls = il2cpp_class_from_type(ftype);
+                auto tname = fcls ? il2cpp_class_get_name(fcls) : "?";
+
+                // Only show fields that might be entity containers
+                if (typeEnum == IL2CPP_TYPE_CLASS || typeEnum == IL2CPP_TYPE_OBJECT ||
+                    typeEnum == IL2CPP_TYPE_GENERICINST) {
+                    uint64_t ptr = 0;
+                    if (foff + 8 <= mSize)
+                        ptr = *(uint64_t *)(mBase + foff);
+
+                    out << "  0x" << std::hex << foff << " " << tname << " " << fname
+                        << " = 0x" << ptr;
+
+                    if (ptr > 0x10000 && ptr < 0x7FFFFFFFFFFF) {
+                        auto obj = reinterpret_cast<Il2CppObject *>(ptr);
+                        if (obj->klass) {
+                            auto kn = il2cpp_class_get_name(obj->klass);
+                            auto kns = il2cpp_class_get_namespace(obj->klass);
+                            out << " -> " << (kns && kns[0] ? kns : "") << "::" << (kn ? kn : "?");
+
+                            // If it's a List, try to read count
+                            if (kn && strstr(kn, "List")) {
+                                auto lBase = reinterpret_cast<uint8_t *>(ptr);
+                                int32_t cnt = *(int32_t *)(lBase + 0x18);
+                                uint64_t arr = *(uint64_t *)(lBase + 0x10);
+                                out << " [count=" << std::dec << cnt
+                                    << " items=0x" << std::hex << arr << "]";
+                            }
+                        }
+                    }
+                    out << "\n";
+                }
+            }
+
+            // Also try iterating using parent class fields (Entity inherits)
+            out << "\n  [MatchGame parent class fields]\n";
+            auto parentK = il2cpp_class_get_parent(matchK);
+            while (parentK) {
+                auto pname = il2cpp_class_get_name(parentK);
+                if (!pname || strcmp(pname, "Object") == 0 || strcmp(pname, "MonoBehaviour") == 0) break;
+                out << "  Parent: " << pname << "\n";
+                void *piter = nullptr;
+                while (auto pf = il2cpp_class_get_fields(parentK, &piter)) {
+                    auto pflags = il2cpp_field_get_flags(pf);
+                    if (pflags & FIELD_ATTRIBUTE_STATIC) continue;
+                    auto pftype = il2cpp_field_get_type(pf);
+                    int ptypeEnum = il2cpp_type_get_type(pftype);
+                    if (ptypeEnum != IL2CPP_TYPE_CLASS && ptypeEnum != IL2CPP_TYPE_OBJECT &&
+                        ptypeEnum != IL2CPP_TYPE_GENERICINST) continue;
+                    auto pfname = il2cpp_field_get_name(pf);
+                    uint32_t pfoff = il2cpp_field_get_offset(pf);
+                    auto pfcls = il2cpp_class_from_type(pftype);
+                    auto ptname = pfcls ? il2cpp_class_get_name(pfcls) : "?";
+
+                    uint64_t ptr = 0;
+                    if (pfoff + 8 <= mSize)
+                        ptr = *(uint64_t *)(mBase + pfoff);
+
+                    out << "    0x" << std::hex << pfoff << " " << ptname << " " << pfname
+                        << " = 0x" << ptr;
+
+                    if (ptr > 0x10000 && ptr < 0x7FFFFFFFFFFF) {
+                        auto obj = reinterpret_cast<Il2CppObject *>(ptr);
+                        if (obj->klass) {
+                            auto kn = il2cpp_class_get_name(obj->klass);
+                            out << " -> " << (kn ? kn : "?");
+                            if (kn && strstr(kn, "List")) {
+                                auto lBase = reinterpret_cast<uint8_t *>(ptr);
+                                int32_t cnt = *(int32_t *)(lBase + 0x18);
+                                out << " [count=" << std::dec << cnt << "]";
+                            }
+                        }
+                    }
+                    out << "\n";
+                }
+                parentK = il2cpp_class_get_parent(parentK);
+            }
+        }
+    }
+
+    // === 2. Raw scan Player memory for HP value (including pointers to buffers) ===
+    out << "\n[Raw Memory Scan for CurHP=" << std::dec << curHP << " (0x"
+        << std::hex << curHP << ")]\n";
+    {
+        auto rawBase = reinterpret_cast<uint8_t *>(localPlayer);
+        uint32_t pSize = il2cpp_class_instance_size(playerK);
+
+        // Scan all pointer fields, follow them, and scan the pointed buffer
+        // for the HP value as both Int32 AND as part of larger structures
+        void *iter = nullptr;
+        while (auto f = il2cpp_class_get_fields(playerK, &iter)) {
+            auto flags = il2cpp_field_get_flags(f);
+            if (flags & FIELD_ATTRIBUTE_STATIC) continue;
+            auto ftype = il2cpp_field_get_type(f);
+            int typeEnum = il2cpp_type_get_type(ftype);
+            if (typeEnum != IL2CPP_TYPE_CLASS && typeEnum != IL2CPP_TYPE_OBJECT) continue;
+
+            uint32_t off = il2cpp_field_get_offset(f);
+            if (off + 8 > pSize) continue;
+            uint64_t ptr = *(uint64_t *)(rawBase + off);
+            if (ptr == 0 || ptr < 0x10000 || ptr > 0x7FFFFFFFFFFF) continue;
+
+            auto obj = reinterpret_cast<Il2CppObject *>(ptr);
+            if (!obj->klass) continue;
+
+            uint32_t subSize = il2cpp_class_instance_size(obj->klass);
+            if (subSize < 16) continue;
+
+            auto subBase = reinterpret_cast<uint8_t *>(ptr);
+
+            // Scan raw bytes for curHP value (4-byte aligned)
+            for (uint32_t s = 0x10; s + 4 <= subSize; s += 4) {
+                int32_t v = *(int32_t *)(subBase + s);
+                if (v == curHP) {
+                    auto fname = il2cpp_field_get_name(f);
+                    auto kn = il2cpp_class_get_name(obj->klass);
+                    out << "  +0x" << std::hex << off << " (" << fname << " -> " << kn
+                        << ") raw[+0x" << s << "] = " << std::dec << v << " *** CurHP ***\n";
+                }
+                if (v == maxHP && maxHP != curHP) {
+                    auto fname = il2cpp_field_get_name(f);
+                    auto kn = il2cpp_class_get_name(obj->klass);
+                    out << "  +0x" << std::hex << off << " (" << fname << " -> " << kn
+                        << ") raw[+0x" << s << "] = " << std::dec << v << " *** MaxHP ***\n";
+                }
+            }
+
+            // Also follow nested pointers (Class/Object fields in sub-objects)
+            // and scan their data buffers
+            void *subIter = nullptr;
+            while (auto sf = il2cpp_class_get_fields(obj->klass, &subIter)) {
+                auto sfl = il2cpp_field_get_flags(sf);
+                if (sfl & FIELD_ATTRIBUTE_STATIC) continue;
+                auto sft = il2cpp_field_get_type(sf);
+                int ste = il2cpp_type_get_type(sft);
+                if (ste != IL2CPP_TYPE_CLASS && ste != IL2CPP_TYPE_OBJECT) continue;
+
+                uint32_t soff = il2cpp_field_get_offset(sf);
+                if (soff + 8 > subSize) continue;
+                uint64_t sptr = *(uint64_t *)(subBase + soff);
+                if (sptr == 0 || sptr < 0x10000 || sptr > 0x7FFFFFFFFFFF) continue;
+
+                auto sobj = reinterpret_cast<Il2CppObject *>(sptr);
+                if (!sobj->klass) continue;
+
+                uint32_t ssSize = il2cpp_class_instance_size(sobj->klass);
+                if (ssSize < 16 || ssSize > 0x2000) continue;
+                auto ssBase = reinterpret_cast<uint8_t *>(sptr);
+
+                for (uint32_t ss = 0x10; ss + 4 <= ssSize; ss += 4) {
+                    int32_t v = *(int32_t *)(ssBase + ss);
+                    if (v == curHP) {
+                        auto fname = il2cpp_field_get_name(f);
+                        auto sfname = il2cpp_field_get_name(sf);
+                        auto skn = il2cpp_class_get_name(sobj->klass);
+                        out << "  +0x" << std::hex << off << "." << sfname
+                            << " (" << fname << " -> " << skn
+                            << ") raw[+0x" << ss << "] = " << std::dec << v
+                            << " *** CurHP ***\n";
+                    }
+                }
+            }
+
+            // Also check: if this object has Array-like fields (SZARRAY),
+            // scan the array contents for HP value
+            void *arrIter = nullptr;
+            while (auto af = il2cpp_class_get_fields(obj->klass, &arrIter)) {
+                auto afl = il2cpp_field_get_flags(af);
+                if (afl & FIELD_ATTRIBUTE_STATIC) continue;
+                auto aft = il2cpp_field_get_type(af);
+                int ate = il2cpp_type_get_type(aft);
+                if (ate != IL2CPP_TYPE_SZARRAY) continue;
+
+                uint32_t aoff = il2cpp_field_get_offset(af);
+                if (aoff + 8 > subSize) continue;
+                uint64_t aptr = *(uint64_t *)(subBase + aoff);
+                if (aptr == 0 || aptr < 0x10000 || aptr > 0x7FFFFFFFFFFF) continue;
+
+                // IL2CPP array: klass(8), monitor(8), bounds(8), max_length(8), vector[]
+                auto arr = reinterpret_cast<Il2CppArray *>(aptr);
+                uint64_t arrLen = arr->max_length;
+                if (arrLen == 0 || arrLen > 1000) continue;
+
+                auto vecBase = reinterpret_cast<uint8_t *>(arr) + 0x20;
+                for (uint64_t ai = 0; ai < arrLen && ai < 200; ++ai) {
+                    int32_t v = *(int32_t *)(vecBase + ai * 4);
+                    if (v == curHP) {
+                        auto fname = il2cpp_field_get_name(f);
+                        auto afname = il2cpp_field_get_name(af);
+                        out << "  +0x" << std::hex << off << "." << afname << "["
+                            << std::dec << ai << "] = " << v << " *** CurHP ***\n";
+                    }
+                }
+            }
+        }
+    }
+
+    // === 3. Direct getter function call + trace COW component ===
+    out << "\n[COW Component Trace]\n";
+    {
+        // The get_CurHP function uses type token 0x23D4
+        // At RVA 0x882aa1c: checks interface availability
+        // At RVA 0x882aad0: gets the COW component object
+        // We call the getter directly and then look at Player+0x70 and nearby
+        // to find the component object
+
+        // Try to find the COW HP component by calling getter AND looking at
+        // what the getter returns vs the component hierarchy
+        auto rawBase = reinterpret_cast<uint8_t *>(localPlayer);
+
+        // Check Player+0x70 (fallback path in getter)
+        uint64_t ptr70 = *(uint64_t *)(rawBase + 0x70);
+        out << "  Player+0x70 = 0x" << std::hex << ptr70;
+        if (ptr70 > 0x10000 && ptr70 < 0x7FFFFFFFFFFF) {
+            auto obj70 = reinterpret_cast<Il2CppObject *>(ptr70);
+            if (obj70->klass) {
+                auto n = il2cpp_class_get_name(obj70->klass);
+                auto ns = il2cpp_class_get_namespace(obj70->klass);
+                uint32_t sz = il2cpp_class_instance_size(obj70->klass);
+                out << " -> " << (ns && ns[0] ? ns : "") << "::" << (n ? n : "?")
+                    << " (size=0x" << std::hex << sz << ")\n";
+                dump_subobject_int32_fields(out, obj70, "    ", curHP, maxHP);
+            } else {
+                out << " (no klass)\n";
+            }
+        } else {
+            out << " (NULL)\n";
+        }
+
+        // Try to find the getter's COW component via type token search
+        // Scan all classes for type token 0x23D4 and 0x23D5
+        out << "\n  [Type Token Search — 0x23D4 (CurHP) and 0x23D5 (MaxHP)]\n";
+        size_t numAssm = 0;
+        auto assemblies = il2cpp_domain_get_assemblies(dom, &numAssm);
+        for (size_t i = 0; i < numAssm; ++i) {
+            auto image = il2cpp_assembly_get_image(assemblies[i]);
+            if (!image) continue;
+            auto classCount = il2cpp_image_get_class_count(image);
+            for (size_t j = 0; j < classCount; ++j) {
+                auto klass = il2cpp_image_get_class(image, j);
+                if (!klass) continue;
+                uint32_t token = il2cpp_class_get_type_token(klass);
+                if (token == 0x23D4 || token == 0x23D5 ||
+                    token == 0x020023D4 || token == 0x020023D5) {
+                    auto tn = il2cpp_class_get_name(klass);
+                    auto tns = il2cpp_class_get_namespace(klass);
+                    uint32_t sz = il2cpp_class_instance_size(klass);
+                    out << "    Token 0x" << std::hex << token << " -> "
+                        << (tns && tns[0] ? tns : "") << "::" << (tn ? tn : "?")
+                        << " (size=0x" << sz << ")\n";
+
+                    // Enumerate fields of this type
+                    out << "    Fields:\n";
+                    void *titer = nullptr;
+                    while (auto tf = il2cpp_class_get_fields(klass, &titer)) {
+                        auto tfl = il2cpp_field_get_flags(tf);
+                        if (tfl & FIELD_ATTRIBUTE_STATIC) continue;
+                        auto tft = il2cpp_field_get_type(tf);
+                        auto tfcls = il2cpp_class_from_type(tft);
+                        auto tfn = il2cpp_field_get_name(tf);
+                        auto ttn = tfcls ? il2cpp_class_get_name(tfcls) : "?";
+                        uint32_t tfo = il2cpp_field_get_offset(tf);
+                        out << "      0x" << std::hex << tfo << " "
+                            << ttn << " " << tfn << "\n";
+                    }
+                }
+            }
+        }
+    }
+
+    out.close();
+    LOGI("=== PHASE 5 DONE — %s ===", outPath.c_str());
 }
 
 // ============================================================
