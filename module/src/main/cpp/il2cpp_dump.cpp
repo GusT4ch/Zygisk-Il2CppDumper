@@ -2853,13 +2853,13 @@ static void resolve_offsets_phase7(std::string outDir) {
 }
 
 // ============================================================
-// Phase 8: Position resolution (minimal — ReplicationData only)
-// Dumps all non-zero ReplicationData[] slots with float interpretation.
-// No Transform access, no Player memory scan.
+// Phase 8: Position validation
+// Reads candidate offsets 0x320 and 0x7E8 twice with 5s gap
+// to confirm they change with player movement.
 // ============================================================
 
 static void resolve_offsets_phase8(std::string outDir) {
-    LOGI("=== PHASE 8: Position resolution ===");
+    LOGI("=== PHASE 8: Position validation ===");
     sleep(35);
 
     auto dom = il2cpp_domain_get();
@@ -2902,42 +2902,69 @@ static void resolve_offsets_phase8(std::string outDir) {
     }
 
     out << "// =============================================\n"
-        << "// Phantom Phase 8 — Position Resolution\n"
+        << "// Phantom Phase 8 — Position Validation\n"
         << "// =============================================\n\n"
         << "Player* = 0x" << std::hex << (uint64_t)localPlayer << "\n"
         << "CurHP = " << std::dec << curHP << "\n\n";
 
     auto rawBase = reinterpret_cast<uint8_t *>(localPlayer);
+    uint32_t pSize = il2cpp_class_instance_size(playerK);
 
-    // Only dump ReplicationData[] — the safest path we know works (Phase 7 used it)
-    out << "[ReplicationData[] — all non-zero slots with float]\n";
-    uint64_t priPtr = *(uint64_t *)(rawBase + 0x70);
-    if (!safe_readable((void *)priPtr, 0x20)) {
-        out << "PRIDataPool not readable\n"; out.close(); return;
+    // Read candidate offsets + all float triplets — sample 1
+    out << "[Sample 1 — move your character after this]\n";
+    float s1_320x = *(float *)(rawBase + 0x320);
+    float s1_320y = *(float *)(rawBase + 0x324);
+    float s1_320z = *(float *)(rawBase + 0x328);
+    float s1_7e8x = *(float *)(rawBase + 0x7E8);
+    float s1_7e8y = *(float *)(rawBase + 0x7EC);
+    float s1_7e8z = *(float *)(rawBase + 0x7F0);
+    out << "  +0x320 = (" << s1_320x << ", " << s1_320y << ", " << s1_320z << ")\n";
+    out << "  +0x7E8 = (" << s1_7e8x << ", " << s1_7e8y << ", " << s1_7e8z << ")\n";
+
+    // Also scan ALL float triplets to find any other candidates
+    out << "\n  [All float triplets in Player]\n";
+    for (uint32_t off = 0x10; off + 12 <= pSize; off += 4) {
+        float fx = *(float *)(rawBase + off);
+        float fy = *(float *)(rawBase + off + 4);
+        float fz = *(float *)(rawBase + off + 8);
+        if (fx > 10.f && fx < 10000.f && fy > -500.f && fy < 10000.f && fz > 10.f && fz < 10000.f) {
+            if (fx != fy || fy != fz) {
+                out << "    +0x" << std::hex << off
+                    << " = (" << fx << ", " << fy << ", " << fz << ")\n";
+            }
+        }
     }
-    auto priBase = reinterpret_cast<uint8_t *>(priPtr);
-    uint64_t datasPtr = *(uint64_t *)(priBase + 0x10);
-    if (!safe_readable((void *)datasPtr, 0x20)) {
-        out << "m_Datas not readable\n"; out.close(); return;
-    }
-    auto datasArr = reinterpret_cast<Il2CppArray *>(datasPtr);
-    uint64_t arrLen = datasArr->max_length;
-    auto arrData = reinterpret_cast<uint8_t *>(datasArr) + 0x20;
-    uint64_t scanMax = arrLen < 260 ? arrLen : 260;
-    out << "Array length = " << std::dec << arrLen << "\n\n";
 
-    for (uint64_t i = 0; i < scanMax; ++i) {
-        if (!safe_readable(arrData + i * 8, 8)) continue;
-        uint64_t elemPtr = *(uint64_t *)(arrData + i * 8);
-        if (!elemPtr || !safe_readable((void *)elemPtr, 0x20)) continue;
-        auto eBase = reinterpret_cast<uint8_t *>(elemPtr);
-        int32_t groupID = *(int32_t *)(eBase + 0x10);
-        int32_t ival = *(int32_t *)(eBase + 0x18);
-        float fval = *(float *)(eBase + 0x18);
+    // Wait 5 seconds for player movement
+    sleep(5);
 
-        if (ival != 0 || i < 5) {
-            out << "[" << std::dec << i << "] grp=" << groupID
-                << " int=" << ival << " float=" << fval << "\n";
+    // Sample 2
+    out << "\n[Sample 2 — 5 seconds later]\n";
+    float s2_320x = *(float *)(rawBase + 0x320);
+    float s2_320y = *(float *)(rawBase + 0x324);
+    float s2_320z = *(float *)(rawBase + 0x328);
+    float s2_7e8x = *(float *)(rawBase + 0x7E8);
+    float s2_7e8y = *(float *)(rawBase + 0x7EC);
+    float s2_7e8z = *(float *)(rawBase + 0x7F0);
+    out << "  +0x320 = (" << s2_320x << ", " << s2_320y << ", " << s2_320z << ")\n";
+    out << "  +0x7E8 = (" << s2_7e8x << ", " << s2_7e8y << ", " << s2_7e8z << ")\n";
+
+    bool moved_320 = (s1_320x != s2_320x || s1_320y != s2_320y || s1_320z != s2_320z);
+    bool moved_7e8 = (s1_7e8x != s2_7e8x || s1_7e8y != s2_7e8y || s1_7e8z != s2_7e8z);
+    out << "\n  +0x320 changed: " << (moved_320 ? "YES" : "NO") << "\n";
+    out << "  +0x7E8 changed: " << (moved_7e8 ? "YES" : "NO") << "\n";
+
+    // Rescan all triplets for sample 2
+    out << "\n  [All float triplets — sample 2]\n";
+    for (uint32_t off = 0x10; off + 12 <= pSize; off += 4) {
+        float fx = *(float *)(rawBase + off);
+        float fy = *(float *)(rawBase + off + 4);
+        float fz = *(float *)(rawBase + off + 8);
+        if (fx > 10.f && fx < 10000.f && fy > -500.f && fy < 10000.f && fz > 10.f && fz < 10000.f) {
+            if (fx != fy || fy != fz) {
+                out << "    +0x" << std::hex << off
+                    << " = (" << fx << ", " << fy << ", " << fz << ")\n";
+            }
         }
     }
 
