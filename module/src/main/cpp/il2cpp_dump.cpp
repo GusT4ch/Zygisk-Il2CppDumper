@@ -451,6 +451,7 @@ static void resolve_offsets_phase2(std::string outDir);
 static void resolve_offsets_phase3(std::string outDir);
 static void resolve_offsets_phase4(std::string outDir);
 static void resolve_offsets_phase5(std::string outDir);
+static void resolve_offsets_phase6(std::string outDir);
 
 // ============================================================
 // Phase 2: Runtime value matching via il2cpp_runtime_invoke
@@ -1064,7 +1065,10 @@ static void resolve_offsets(const char *outDir) {
     std::string dirCopy4(outDir);
     std::thread phase5(resolve_offsets_phase5, dirCopy4);
     phase5.detach();
-    LOGI("Phase 2-5 threads spawned — enter a match to resolve offsets");
+    std::string dirCopy5(outDir);
+    std::thread phase6(resolve_offsets_phase6, dirCopy5);
+    phase6.detach();
+    LOGI("Phase 2-6 threads spawned — enter a match to resolve offsets");
 }
 
 // ============================================================
@@ -2191,6 +2195,353 @@ static void resolve_offsets_phase5(std::string outDir) {
 
     out.close();
     LOGI("=== PHASE 5 DONE — %s ===", outPath.c_str());
+}
+
+// ============================================================
+// Phase 6: PRIDataPool deep trace + Dictionary entity iteration
+// Dumps raw bytes of PRIDataPool, follows every pointer to find
+// the COW replication data buffer where HP is stored.
+// Also iterates the Dictionary<int,Entity> for remote players.
+// ============================================================
+
+static void resolve_offsets_phase6(std::string outDir) {
+    LOGI("=== PHASE 6: PRIDataPool deep trace ===");
+    sleep(20);
+
+    auto dom = il2cpp_domain_get();
+    if (!dom) { LOGE("Phase6: domain null"); return; }
+    auto thr = il2cpp_thread_attach(dom);
+    if (!thr) { LOGE("Phase6: thread attach fail"); return; }
+
+    auto outPath = outDir + "/files/pridatapool_trace.txt";
+    std::ofstream out(outPath);
+    if (!out.is_open()) { LOGE("Phase6: Cannot open %s", outPath.c_str()); return; }
+
+    auto facadeK = find_class_all("COW", "GameFacade");
+    auto playerK = find_class_all("COW.GamePlay", "Player");
+    if (!facadeK || !playerK) { out << "Missing classes\n"; out.close(); return; }
+
+    auto clpMethod = il2cpp_class_get_method_from_name(facadeK, "CurrentLocalPlayer", 0);
+    auto getCurHP  = il2cpp_class_get_method_from_name(playerK, "get_CurHP", 0);
+    auto getMaxHP  = il2cpp_class_get_method_from_name(playerK, "get_MaxHP", 0);
+    if (!clpMethod || !getCurHP || !getMaxHP) { out << "Missing methods\n"; out.close(); return; }
+
+    Il2CppObject *localPlayer = nullptr;
+    int32_t curHP = 0, maxHP = 0;
+    for (int attempt = 0; attempt < 180; ++attempt) {
+        Il2CppException *exc = nullptr;
+        auto r = il2cpp_runtime_invoke(clpMethod, nullptr, nullptr, &exc);
+        if (!exc && r) {
+            localPlayer = r;
+            exc = nullptr;
+            auto rH = il2cpp_runtime_invoke(getCurHP, localPlayer, nullptr, &exc);
+            if (!exc && rH) curHP = *(int32_t *)il2cpp_object_unbox(rH);
+            exc = nullptr;
+            auto rM = il2cpp_runtime_invoke(getMaxHP, localPlayer, nullptr, &exc);
+            if (!exc && rM) maxHP = *(int32_t *)il2cpp_object_unbox(rM);
+            if (curHP > 0 && maxHP > 0) break;
+        }
+        sleep(3);
+    }
+    if (!localPlayer || curHP <= 0) {
+        out << "Phase6: Player not alive\n"; out.close(); return;
+    }
+
+    out << "// =============================================\n"
+        << "// Phantom Phase 6 — PRIDataPool Deep Trace\n"
+        << "// =============================================\n\n"
+        << "Player* = 0x" << std::hex << (uint64_t)localPlayer << "\n"
+        << "CurHP = " << std::dec << curHP << "  MaxHP = " << maxHP << "\n\n";
+
+    auto rawBase = reinterpret_cast<uint8_t *>(localPlayer);
+
+    // === 1. Dump PRIDataPool (Player+0x70) raw bytes ===
+    out << "[PRIDataPool Raw Dump — Player+0x70]\n";
+    uint64_t priPtr = *(uint64_t *)(rawBase + 0x70);
+    out << "  PRIDataPool* = 0x" << std::hex << priPtr << "\n";
+    if (priPtr > 0x10000 && priPtr < 0x7FFFFFFFFFFF) {
+        auto priBase = reinterpret_cast<uint8_t *>(priPtr);
+        auto priObj = reinterpret_cast<Il2CppObject *>(priPtr);
+        uint32_t priSize = 0x40;
+        if (priObj->klass) {
+            priSize = il2cpp_class_instance_size(priObj->klass);
+            auto pn = il2cpp_class_get_name(priObj->klass);
+            out << "  Class: " << (pn ? pn : "?") << " size=0x" << std::hex << priSize << "\n";
+
+            // Enumerate ALL fields including parent classes
+            out << "  [All fields incl. inherited]\n";
+            auto k = priObj->klass;
+            while (k) {
+                auto kname = il2cpp_class_get_name(k);
+                if (!kname || strcmp(kname, "Object") == 0) break;
+                void *iter = nullptr;
+                while (auto f = il2cpp_class_get_fields(k, &iter)) {
+                    auto fflags = il2cpp_field_get_flags(f);
+                    if (fflags & FIELD_ATTRIBUTE_STATIC) continue;
+                    auto fname = il2cpp_field_get_name(f);
+                    uint32_t foff = il2cpp_field_get_offset(f);
+                    auto ftype = il2cpp_field_get_type(f);
+                    auto fcls = il2cpp_class_from_type(ftype);
+                    auto tname = fcls ? il2cpp_class_get_name(fcls) : "?";
+                    out << "    0x" << std::hex << foff << " " << tname << " " << fname
+                        << " (" << kname << ")\n";
+                }
+                k = il2cpp_class_get_parent(k);
+            }
+        }
+
+        // Raw hex dump
+        out << "\n  [Raw Hex — 0x" << std::hex << priSize << " bytes]\n  ";
+        for (uint32_t i = 0; i < priSize && i < 0x100; ++i) {
+            char hex[4];
+            snprintf(hex, sizeof(hex), "%02x", priBase[i]);
+            out << hex;
+            if ((i + 1) % 8 == 0) out << " ";
+            if ((i + 1) % 32 == 0) out << "\n  ";
+        }
+        out << "\n";
+
+        // Follow every 8-byte aligned pointer in PRIDataPool
+        out << "\n  [Following pointers in PRIDataPool]\n";
+        for (uint32_t off = 0x10; off + 8 <= priSize; off += 8) {
+            uint64_t ptr = *(uint64_t *)(priBase + off);
+            if (ptr == 0 || ptr < 0x10000 || ptr > 0x7FFFFFFFFFFF) continue;
+
+            out << "  +0x" << std::hex << off << " = 0x" << ptr;
+
+            // Try to identify what this points to
+            auto pObj = reinterpret_cast<Il2CppObject *>(ptr);
+            if (pObj->klass) {
+                auto kn = il2cpp_class_get_name(pObj->klass);
+                auto ns = il2cpp_class_get_namespace(pObj->klass);
+                if (kn) {
+                    uint32_t sz = il2cpp_class_instance_size(pObj->klass);
+                    out << " -> " << (ns && ns[0] ? ns : "") << "::" << kn
+                        << " (size=0x" << sz << ")";
+
+                    // Scan this sub-object for curHP value
+                    auto subBase = reinterpret_cast<uint8_t *>(ptr);
+                    for (uint32_t s = 0x10; s + 4 <= sz && s < 0x400; s += 4) {
+                        int32_t v = *(int32_t *)(subBase + s);
+                        if (v == curHP) {
+                            out << "\n    *** raw[+0x" << s << "] = " << std::dec << v
+                                << " *** MATCH CurHP ***" << std::hex;
+                        }
+                        if (v == maxHP && maxHP != curHP) {
+                            out << "\n    *** raw[+0x" << s << "] = " << std::dec << v
+                                << " *** MATCH MaxHP ***" << std::hex;
+                        }
+                    }
+
+                    // If small, hex dump it
+                    if (sz <= 0x80) {
+                        out << "\n    Hex: ";
+                        for (uint32_t h = 0; h < sz; ++h) {
+                            char hx[4];
+                            snprintf(hx, sizeof(hx), "%02x", subBase[h]);
+                            out << hx;
+                            if ((h + 1) % 8 == 0) out << " ";
+                        }
+                    }
+
+                    // Follow pointers from this sub-object too (depth 2)
+                    for (uint32_t s2 = 0x10; s2 + 8 <= sz; s2 += 8) {
+                        uint64_t p2 = *(uint64_t *)(subBase + s2);
+                        if (p2 == 0 || p2 < 0x10000 || p2 > 0x7FFFFFFFFFFF) continue;
+                        auto o2 = reinterpret_cast<Il2CppObject *>(p2);
+                        if (!o2->klass) continue;
+                        auto n2 = il2cpp_class_get_name(o2->klass);
+                        if (!n2) continue;
+                        uint32_t s2sz = il2cpp_class_instance_size(o2->klass);
+                        if (s2sz < 16 || s2sz > 0x2000) continue;
+
+                        auto b2 = reinterpret_cast<uint8_t *>(p2);
+                        for (uint32_t x = 0x10; x + 4 <= s2sz && x < 0x800; x += 4) {
+                            int32_t v = *(int32_t *)(b2 + x);
+                            if (v == curHP) {
+                                out << "\n    +0x" << std::hex << s2 << " -> " << n2
+                                    << "[+0x" << x << "] = " << std::dec << v
+                                    << " *** MATCH CurHP ***" << std::hex;
+                            }
+                            if (v == maxHP && maxHP != curHP) {
+                                out << "\n    +0x" << std::hex << s2 << " -> " << n2
+                                    << "[+0x" << x << "] = " << std::dec << v
+                                    << " *** MATCH MaxHP ***" << std::hex;
+                            }
+                        }
+                    }
+                }
+            }
+            out << "\n";
+        }
+    }
+
+    // === 2. Scan raw Player memory for the HP value as float ===
+    out << "\n[Float Scan — looking for " << std::dec << curHP << ".0f and "
+        << maxHP << ".0f in Player]\n";
+    {
+        float fCurHP = (float)curHP;
+        float fMaxHP = (float)maxHP;
+        uint32_t pSize = il2cpp_class_instance_size(playerK);
+        for (uint32_t off = 0x10; off + 4 <= pSize; off += 4) {
+            float v = *(float *)(rawBase + off);
+            if (v == fCurHP) {
+                out << "  Player+0x" << std::hex << off << " = " << std::dec << v
+                    << "f *** MATCH CurHP as float ***\n";
+            }
+            if (v == fMaxHP && fMaxHP != fCurHP) {
+                out << "  Player+0x" << std::hex << off << " = " << std::dec << v
+                    << "f *** MATCH MaxHP as float ***\n";
+            }
+        }
+    }
+
+    // === 3. Dictionary iteration for remote players ===
+    out << "\n[Dictionary Entity Iteration]\n";
+    {
+        auto matchK = find_class_all("COW", "MatchGame");
+        if (matchK) {
+            auto cmgField = il2cpp_class_get_field_from_name(facadeK, "CurrentMatchGame");
+            Il2CppObject *matchObj = nullptr;
+            if (cmgField) {
+                auto sd = il2cpp_class_get_static_field_data(facadeK);
+                if (sd) {
+                    uint32_t cmgOff = il2cpp_field_get_offset(cmgField);
+                    uint64_t mPtr = *(uint64_t *)((uint8_t *)sd + cmgOff);
+                    if (mPtr > 0x10000) matchObj = reinterpret_cast<Il2CppObject *>(mPtr);
+                }
+            }
+
+            if (matchObj) {
+                auto mBase = reinterpret_cast<uint8_t *>(matchObj);
+                // m_ReplicationEntitis at +0xC0 is Dictionary<int, Entity>
+                uint64_t dictPtr = *(uint64_t *)(mBase + 0xC0);
+                out << "  m_ReplicationEntitis (Dict) = 0x" << std::hex << dictPtr << "\n";
+
+                if (dictPtr > 0x10000 && dictPtr < 0x7FFFFFFFFFFF) {
+                    auto dictBase = reinterpret_cast<uint8_t *>(dictPtr);
+                    // Dictionary<K,V> internal layout:
+                    // +0x10 = int[] buckets
+                    // +0x18 = Entry[] entries
+                    // +0x20 = int count
+                    // +0x28 = int version
+                    // +0x30 = int freeList
+                    // +0x38 = int freeCount
+                    int32_t count   = *(int32_t *)(dictBase + 0x20);
+                    int32_t version = *(int32_t *)(dictBase + 0x28);
+                    uint64_t entriesPtr = *(uint64_t *)(dictBase + 0x18);
+                    out << "  count=" << std::dec << count
+                        << " version=" << version
+                        << " entries=0x" << std::hex << entriesPtr << "\n";
+
+                    if (count > 0 && count < 200 && entriesPtr > 0x10000) {
+                        // Entry struct: hashCode(4), next(4), key(4), padding(4), value(8)
+                        // = 24 bytes per entry
+                        // Array header: klass(8), monitor(8), bounds(8), max_length(8), data[]
+                        auto entArr = reinterpret_cast<Il2CppArray *>(entriesPtr);
+                        uint64_t arrLen = entArr->max_length;
+                        auto vecBase = reinterpret_cast<uint8_t *>(entArr) + 0x20;
+                        out << "  entries array max_length=" << std::dec << arrLen << "\n";
+
+                        // Entry size: hashCode(4) + next(4) + key(TKey=int,4) + pad(4) + value(TValue=ptr,8) = 24
+                        // OR: hashCode(4) + next(4) + key(8) + value(8) = 24
+                        // Let's detect by scanning
+                        int found = 0;
+                        for (uint64_t e = 0; e < arrLen && e < 100 && found < 20; ++e) {
+                            // Try stride=24 (hash4+next4+key4+pad4+value8)
+                            uint8_t *ent = vecBase + e * 24;
+                            int32_t hash = *(int32_t *)(ent + 0);
+                            int32_t key  = *(int32_t *)(ent + 8);
+                            uint64_t val = *(uint64_t *)(ent + 16);
+
+                            if (hash == -1) continue; // empty slot
+                            if (val == 0 || val < 0x10000 || val > 0x7FFFFFFFFFFF) continue;
+
+                            auto entObj = reinterpret_cast<Il2CppObject *>(val);
+                            if (!entObj->klass) continue;
+                            auto en = il2cpp_class_get_name(entObj->klass);
+                            auto ens = il2cpp_class_get_namespace(entObj->klass);
+
+                            out << "\n  [" << std::dec << e << "] key=" << key
+                                << " -> " << (ens && ens[0] ? ens : "") << "::" << (en ? en : "?")
+                                << " @ 0x" << std::hex << val;
+
+                            bool isLocal = (val == (uint64_t)localPlayer);
+                            out << (isLocal ? " (LOCAL)" : " (REMOTE)");
+
+                            // For each entity, try calling get_CurHP/get_MaxHP
+                            if (!isLocal) {
+                                Il2CppException *exc = nullptr;
+                                auto rHP = il2cpp_runtime_invoke(getCurHP, entObj, nullptr, &exc);
+                                int32_t rCur = 0;
+                                if (!exc && rHP) rCur = *(int32_t *)il2cpp_object_unbox(rHP);
+                                else out << " (getCurHP exc)";
+
+                                exc = nullptr;
+                                auto rMHP = il2cpp_runtime_invoke(getMaxHP, entObj, nullptr, &exc);
+                                int32_t rMax = 0;
+                                if (!exc && rMHP) rMax = *(int32_t *)il2cpp_object_unbox(rMHP);
+
+                                out << " CurHP=" << std::dec << rCur << " MaxHP=" << rMax;
+
+                                // Check Player+0x70 on remote
+                                auto rBase = reinterpret_cast<uint8_t *>(val);
+                                uint64_t rPri = *(uint64_t *)(rBase + 0x70);
+                                out << " +0x70=0x" << std::hex << rPri;
+                                if (rPri > 0x10000 && rPri < 0x7FFFFFFFFFFF) {
+                                    auto rpObj = reinterpret_cast<Il2CppObject *>(rPri);
+                                    if (rpObj->klass) {
+                                        auto rpn = il2cpp_class_get_name(rpObj->klass);
+                                        uint32_t rpSz = il2cpp_class_instance_size(rpObj->klass);
+                                        out << " -> " << (rpn ? rpn : "?")
+                                            << " (size=0x" << rpSz << ")";
+
+                                        // Scan remote PRIDataPool for HP value
+                                        auto rpBase = reinterpret_cast<uint8_t *>(rPri);
+                                        for (uint32_t x = 0x10; x + 4 <= rpSz; x += 4) {
+                                            int32_t v = *(int32_t *)(rpBase + x);
+                                            if (v == rCur && rCur > 0) {
+                                                out << "\n    PRI[+0x" << std::hex << x
+                                                    << "] = " << std::dec << v
+                                                    << " *** MATCH remote CurHP ***";
+                                            }
+                                        }
+
+                                        // Follow pointers from remote PRIDataPool
+                                        for (uint32_t x = 0x10; x + 8 <= rpSz; x += 8) {
+                                            uint64_t xp = *(uint64_t *)(rpBase + x);
+                                            if (xp == 0 || xp < 0x10000 || xp > 0x7FFFFFFFFFFF) continue;
+                                            auto xo = reinterpret_cast<Il2CppObject *>(xp);
+                                            if (!xo->klass) continue;
+                                            auto xn = il2cpp_class_get_name(xo->klass);
+                                            uint32_t xsz = il2cpp_class_instance_size(xo->klass);
+                                            if (xsz < 16 || xsz > 0x2000) continue;
+                                            auto xb = reinterpret_cast<uint8_t *>(xp);
+                                            for (uint32_t y = 0x10; y + 4 <= xsz && y < 0x400; y += 4) {
+                                                int32_t v = *(int32_t *)(xb + y);
+                                                if (v == rCur && rCur > 0) {
+                                                    out << "\n    PRI+0x" << std::hex << x
+                                                        << " -> " << xn << "[+0x" << y
+                                                        << "] = " << std::dec << v
+                                                        << " *** MATCH remote CurHP ***";
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            out << "\n";
+                            ++found;
+                        }
+                        if (found == 0) out << "  No valid entities found with stride=24\n";
+                    }
+                }
+            }
+        }
+    }
+
+    out.close();
+    LOGI("=== PHASE 6 DONE — %s ===", outPath.c_str());
 }
 
 // ============================================================
