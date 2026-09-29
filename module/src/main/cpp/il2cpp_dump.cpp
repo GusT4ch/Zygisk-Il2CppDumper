@@ -1074,11 +1074,10 @@ static void resolve_offsets(const char *outDir) {
     std::string dirCopy6(outDir);
     std::thread phase7(resolve_offsets_phase7, dirCopy6);
     phase7.detach();
-    // Phase 8 disabled — was crashing FF
-    // std::string dirCopy7(outDir);
-    // std::thread phase8(resolve_offsets_phase8, dirCopy7);
-    // phase8.detach();
-    LOGI("Phase 2-7 threads spawned — enter a match to resolve offsets");
+    std::string dirCopy7(outDir);
+    std::thread phase8(resolve_offsets_phase8, dirCopy7);
+    phase8.detach();
+    LOGI("Phase 2-8 threads spawned — enter a match to resolve offsets");
 }
 
 // ============================================================
@@ -2854,9 +2853,9 @@ static void resolve_offsets_phase7(std::string outDir) {
 }
 
 // ============================================================
-// Phase 8: Position resolution (ultra-safe)
-// Only reads managed IL2CPP objects — NO native pointer chasing.
-// Dumps Transform fields/hex, ReplicationData floats, Player floats.
+// Phase 8: Position resolution (minimal — ReplicationData only)
+// Dumps all non-zero ReplicationData[] slots with float interpretation.
+// No Transform access, no Player memory scan.
 // ============================================================
 
 static void resolve_offsets_phase8(std::string outDir) {
@@ -2910,102 +2909,35 @@ static void resolve_offsets_phase8(std::string outDir) {
 
     auto rawBase = reinterpret_cast<uint8_t *>(localPlayer);
 
-    // === 1. Transform info (managed object only, no native chase) ===
-    out << "[1. Transform — Entity+0x58]\n";
-    uint64_t cachedTransform = *(uint64_t *)(rawBase + 0x58);
-    out << "  m_CachedTransform = 0x" << std::hex << cachedTransform << "\n";
-
-    if (safe_readable((void *)cachedTransform, 0x40)) {
-        auto tObj = reinterpret_cast<Il2CppObject *>(cachedTransform);
-        auto tBase = reinterpret_cast<uint8_t *>(cachedTransform);
-        if (tObj->klass) {
-            auto tn = il2cpp_class_get_name(tObj->klass);
-            auto tns = il2cpp_class_get_namespace(tObj->klass);
-            uint32_t tsz = il2cpp_class_instance_size(tObj->klass);
-            out << "  Class: " << (tns && tns[0] ? tns : "") << "::" << (tn ? tn : "?")
-                << " (size=0x" << std::hex << tsz << ")\n";
-
-            out << "  [Fields]\n";
-            auto tk = tObj->klass;
-            while (tk) {
-                auto kn = il2cpp_class_get_name(tk);
-                if (!kn || strcmp(kn, "Object") == 0) break;
-                void *iter = nullptr;
-                while (auto f = il2cpp_class_get_fields(tk, &iter)) {
-                    if (il2cpp_field_get_flags(f) & FIELD_ATTRIBUTE_STATIC) continue;
-                    auto fname = il2cpp_field_get_name(f);
-                    uint32_t foff = il2cpp_field_get_offset(f);
-                    auto ftype = il2cpp_field_get_type(f);
-                    auto fcls = il2cpp_class_from_type(ftype);
-                    auto ftname = fcls ? il2cpp_class_get_name(fcls) : "?";
-                    out << "    0x" << std::hex << foff << " " << ftname << " " << fname << "\n";
-                }
-                tk = il2cpp_class_get_parent(tk);
-            }
-
-            // Raw hex of managed Transform object only
-            uint32_t dumpSz = tsz < 0x60 ? tsz : 0x60;
-            if (safe_readable(tBase, dumpSz)) {
-                out << "  [Raw hex — 0x" << std::hex << dumpSz << " bytes]\n  ";
-                for (uint32_t i = 0; i < dumpSz; ++i) {
-                    char hx[4]; snprintf(hx, sizeof(hx), "%02x", tBase[i]);
-                    out << hx;
-                    if ((i+1) % 8 == 0) out << " ";
-                    if ((i+1) % 32 == 0) out << "\n  ";
-                }
-                out << "\n";
-            }
-        }
+    // Only dump ReplicationData[] — the safest path we know works (Phase 7 used it)
+    out << "[ReplicationData[] — all non-zero slots with float]\n";
+    uint64_t priPtr = *(uint64_t *)(rawBase + 0x70);
+    if (!safe_readable((void *)priPtr, 0x20)) {
+        out << "PRIDataPool not readable\n"; out.close(); return;
     }
-
-    // === 2. All ReplicationData[] slots with float + int interpretation ===
-    out << "\n[2. ReplicationData[] — all non-zero slots]\n";
-    {
-        uint64_t priPtr = *(uint64_t *)(rawBase + 0x70);
-        if (safe_readable((void *)priPtr, 0x40)) {
-            auto priBase = reinterpret_cast<uint8_t *>(priPtr);
-            uint64_t datasPtr = *(uint64_t *)(priBase + 0x10);
-            if (safe_readable((void *)datasPtr, 0x20)) {
-                auto datasArr = reinterpret_cast<Il2CppArray *>(datasPtr);
-                uint64_t arrLen = datasArr->max_length;
-                auto arrData = reinterpret_cast<uint8_t *>(datasArr) + 0x20;
-                uint64_t scanMax = arrLen < 260 ? arrLen : 260;
-                out << "  Array length = " << std::dec << arrLen << "\n";
-
-                for (uint64_t i = 0; i < scanMax; ++i) {
-                    uint64_t elemPtr = *(uint64_t *)(arrData + i * 8);
-                    if (!elemPtr || !safe_readable((void *)elemPtr, 0x20)) continue;
-                    auto eBase = reinterpret_cast<uint8_t *>(elemPtr);
-                    int32_t groupID = *(int32_t *)(eBase + 0x10);
-                    int32_t ival = *(int32_t *)(eBase + 0x18);
-                    float fval = *(float *)(eBase + 0x18);
-
-                    // Print all non-zero slots
-                    if (ival != 0 || i < 5) {
-                        out << "  [" << std::dec << i << "] grp=" << groupID
-                            << " int=" << ival << " float=" << fval << "\n";
-                    }
-                }
-            }
-        }
+    auto priBase = reinterpret_cast<uint8_t *>(priPtr);
+    uint64_t datasPtr = *(uint64_t *)(priBase + 0x10);
+    if (!safe_readable((void *)datasPtr, 0x20)) {
+        out << "m_Datas not readable\n"; out.close(); return;
     }
+    auto datasArr = reinterpret_cast<Il2CppArray *>(datasPtr);
+    uint64_t arrLen = datasArr->max_length;
+    auto arrData = reinterpret_cast<uint8_t *>(datasArr) + 0x20;
+    uint64_t scanMax = arrLen < 260 ? arrLen : 260;
+    out << "Array length = " << std::dec << arrLen << "\n\n";
 
-    // === 3. Player float triplets that could be world position ===
-    out << "\n[3. Player memory — float triplets (world-coord candidates)]\n";
-    {
-        uint32_t pSize = il2cpp_class_instance_size(playerK);
-        if (safe_readable(rawBase, pSize)) {
-            for (uint32_t off = 0x10; off + 12 <= pSize; off += 4) {
-                float fx = *(float *)(rawBase + off);
-                float fy = *(float *)(rawBase + off + 4);
-                float fz = *(float *)(rawBase + off + 8);
-                if (fx > 10.f && fx < 10000.f && fy > 1.f && fy < 10000.f && fz > 10.f && fz < 10000.f) {
-                    if (fx != fy || fy != fz) {
-                        out << "  +0x" << std::hex << off
-                            << " = (" << fx << ", " << fy << ", " << fz << ")\n";
-                    }
-                }
-            }
+    for (uint64_t i = 0; i < scanMax; ++i) {
+        if (!safe_readable(arrData + i * 8, 8)) continue;
+        uint64_t elemPtr = *(uint64_t *)(arrData + i * 8);
+        if (!elemPtr || !safe_readable((void *)elemPtr, 0x20)) continue;
+        auto eBase = reinterpret_cast<uint8_t *>(elemPtr);
+        int32_t groupID = *(int32_t *)(eBase + 0x10);
+        int32_t ival = *(int32_t *)(eBase + 0x18);
+        float fval = *(float *)(eBase + 0x18);
+
+        if (ival != 0 || i < 5) {
+            out << "[" << std::dec << i << "] grp=" << groupID
+                << " int=" << ival << " float=" << fval << "\n";
         }
     }
 
