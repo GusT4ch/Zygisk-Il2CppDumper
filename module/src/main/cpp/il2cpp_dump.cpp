@@ -483,8 +483,19 @@ static void collect_field_candidates(Il2CppClass *klass, std::vector<FieldCandid
 static void resolve_offsets_phase2(std::string outDir) {
     LOGI("=== PHASE 2: Value matching thread started ===");
 
+    // Delay de 5 segundos pra garantir IL2CPP estabilizado
+    sleep(5);
+
     auto dom = il2cpp_domain_get();
+    if (!dom) {
+        LOGE("Phase2: il2cpp_domain_get() returned nullptr");
+        return;
+    }
     auto thr = il2cpp_thread_attach(dom);
+    if (!thr) {
+        LOGE("Phase2: il2cpp_thread_attach() failed");
+        return;
+    }
     LOGI("Phase2: thread attached to domain");
 
     // Find GameFacade::CurrentLocalPlayer
