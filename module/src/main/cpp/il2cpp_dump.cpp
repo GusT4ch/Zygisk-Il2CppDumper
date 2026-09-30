@@ -2853,9 +2853,9 @@ static void resolve_offsets_phase7(std::string outDir) {
 }
 
 // ============================================================
-// Phase 8: Position validation
-// Reads candidate offsets 0x320 and 0x7E8 twice with 5s gap
-// to confirm they change with player movement.
+// Phase 8: Position validation (ultra-minimal)
+// ONLY reads 12 bytes at 0x320 and 0x7E8 — no full Player scan.
+// Two samples with 5s gap to confirm values change with movement.
 // ============================================================
 
 static void resolve_offsets_phase8(std::string outDir) {
@@ -2872,46 +2872,32 @@ static void resolve_offsets_phase8(std::string outDir) {
     if (!out.is_open()) { LOGE("Phase8: Cannot open %s", outPath.c_str()); return; }
 
     auto facadeK = find_class_all("COW", "GameFacade");
-    auto playerK = find_class_all("COW.GamePlay", "Player");
-    if (!facadeK || !playerK) {
-        out << "Missing classes\n"; out.close(); return;
-    }
+    if (!facadeK) { out << "Missing GameFacade\n"; out.close(); return; }
 
     auto clpMethod = il2cpp_class_get_method_from_name(facadeK, "CurrentLocalPlayer", 0);
-    auto getCurHP  = il2cpp_class_get_method_from_name(playerK, "get_CurHP", 0);
-    if (!clpMethod || !getCurHP) {
-        out << "Missing methods\n"; out.close(); return;
-    }
+    if (!clpMethod) { out << "Missing CLP\n"; out.close(); return; }
 
     Il2CppObject *localPlayer = nullptr;
-    int32_t curHP = 0;
     for (int attempt = 0; attempt < 180; ++attempt) {
         Il2CppException *exc = nullptr;
         auto r = il2cpp_runtime_invoke(clpMethod, nullptr, nullptr, &exc);
-        if (!exc && r) {
-            localPlayer = r;
-            exc = nullptr;
-            auto rH = il2cpp_runtime_invoke(getCurHP, localPlayer, nullptr, &exc);
-            if (!exc && rH) curHP = *(int32_t *)il2cpp_object_unbox(rH);
-            if (curHP > 0) break;
-        }
+        if (!exc && r) { localPlayer = r; break; }
         sleep(3);
     }
-    if (!localPlayer || curHP <= 0) {
-        out << "Phase8: Player not alive\n"; out.close(); return;
+    if (!localPlayer) {
+        out << "Phase8: No player\n"; out.close(); return;
     }
 
-    out << "// =============================================\n"
-        << "// Phantom Phase 8 — Position Validation\n"
-        << "// =============================================\n\n"
-        << "Player* = 0x" << std::hex << (uint64_t)localPlayer << "\n"
-        << "CurHP = " << std::dec << curHP << "\n\n";
-
     auto rawBase = reinterpret_cast<uint8_t *>(localPlayer);
-    uint32_t pSize = il2cpp_class_instance_size(playerK);
 
-    // Read candidate offsets + all float triplets — sample 1
-    out << "[Sample 1 — move your character after this]\n";
+    out << "// =============================================\n"
+        << "// Phantom Phase 8 — Position Validation (v6)\n"
+        << "// FF version 1.132.9\n"
+        << "// =============================================\n\n"
+        << "Player* = 0x" << std::hex << (uint64_t)localPlayer << "\n\n";
+
+    // Sample 1 — only read the two known candidate offsets
+    out << "[Sample 1]\n";
     float s1_320x = *(float *)(rawBase + 0x320);
     float s1_320y = *(float *)(rawBase + 0x324);
     float s1_320z = *(float *)(rawBase + 0x328);
@@ -2921,25 +2907,25 @@ static void resolve_offsets_phase8(std::string outDir) {
     out << "  +0x320 = (" << s1_320x << ", " << s1_320y << ", " << s1_320z << ")\n";
     out << "  +0x7E8 = (" << s1_7e8x << ", " << s1_7e8y << ", " << s1_7e8z << ")\n";
 
-    // Also scan ALL float triplets to find any other candidates
-    out << "\n  [All float triplets in Player]\n";
-    for (uint32_t off = 0x10; off + 12 <= pSize; off += 4) {
-        float fx = *(float *)(rawBase + off);
-        float fy = *(float *)(rawBase + off + 4);
-        float fz = *(float *)(rawBase + off + 8);
-        if (fx > 10.f && fx < 10000.f && fy > -500.f && fy < 10000.f && fz > 10.f && fz < 10000.f) {
-            if (fx != fy || fy != fz) {
-                out << "    +0x" << std::hex << off
-                    << " = (" << fx << ", " << fy << ", " << fz << ")\n";
+    // Also check HP to confirm player is alive and offsets still work
+    uint64_t priPtr = *(uint64_t *)(rawBase + 0x70);
+    if (safe_readable((void *)priPtr, 0x20)) {
+        auto priBase = reinterpret_cast<uint8_t *>(priPtr);
+        uint64_t datasPtr = *(uint64_t *)(priBase + 0x10);
+        if (safe_readable((void *)datasPtr, 0x28)) {
+            auto arrData = reinterpret_cast<uint8_t *>(datasPtr) + 0x20;
+            uint64_t elem0 = *(uint64_t *)(arrData);
+            if (safe_readable((void *)elem0, 0x20)) {
+                int32_t hp = *(int32_t *)(reinterpret_cast<uint8_t *>(elem0) + 0x18);
+                out << "  CurHP (repl[0]) = " << std::dec << hp << "\n";
             }
         }
     }
 
-    // Wait 5 seconds for player movement
     sleep(5);
 
     // Sample 2
-    out << "\n[Sample 2 — 5 seconds later]\n";
+    out << "\n[Sample 2 — 5s later]\n";
     float s2_320x = *(float *)(rawBase + 0x320);
     float s2_320y = *(float *)(rawBase + 0x324);
     float s2_320z = *(float *)(rawBase + 0x328);
@@ -2953,20 +2939,6 @@ static void resolve_offsets_phase8(std::string outDir) {
     bool moved_7e8 = (s1_7e8x != s2_7e8x || s1_7e8y != s2_7e8y || s1_7e8z != s2_7e8z);
     out << "\n  +0x320 changed: " << (moved_320 ? "YES" : "NO") << "\n";
     out << "  +0x7E8 changed: " << (moved_7e8 ? "YES" : "NO") << "\n";
-
-    // Rescan all triplets for sample 2
-    out << "\n  [All float triplets — sample 2]\n";
-    for (uint32_t off = 0x10; off + 12 <= pSize; off += 4) {
-        float fx = *(float *)(rawBase + off);
-        float fy = *(float *)(rawBase + off + 4);
-        float fz = *(float *)(rawBase + off + 8);
-        if (fx > 10.f && fx < 10000.f && fy > -500.f && fy < 10000.f && fz > 10.f && fz < 10000.f) {
-            if (fx != fy || fy != fz) {
-                out << "    +0x" << std::hex << off
-                    << " = (" << fx << ", " << fy << ", " << fz << ")\n";
-            }
-        }
-    }
 
     out.close();
     LOGI("=== PHASE 8 DONE — %s ===", outPath.c_str());
