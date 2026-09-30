@@ -1074,10 +1074,8 @@ static void resolve_offsets(const char *outDir) {
     std::string dirCopy6(outDir);
     std::thread phase7(resolve_offsets_phase7, dirCopy6);
     phase7.detach();
-    std::string dirCopy7(outDir);
-    std::thread phase8(resolve_offsets_phase8, dirCopy7);
-    phase8.detach();
-    LOGI("Phase 2-8 threads spawned — enter a match to resolve offsets");
+    // Phase 8 disabled — extra thread crashes FF. Position validation moved into Phase 7.
+    LOGI("Phase 2-7 threads spawned (Position validation in Phase 7b)");
 }
 
 // ============================================================
@@ -2850,6 +2848,47 @@ static void resolve_offsets_phase7(std::string outDir) {
 
     out.close();
     LOGI("=== PHASE 7 DONE — %s ===", outPath.c_str());
+
+    // --- Position validation (appended to Phase 7 thread) ---
+    auto posPath = outDir + "/files/position_trace.txt";
+    std::ofstream posOut(posPath);
+    if (!posOut.is_open()) { LOGE("Phase7-pos: Cannot open %s", posPath.c_str()); return; }
+
+    posOut << "// =============================================\n"
+           << "// Phantom Phase 7b — Position Validation\n"
+           << "// =============================================\n\n"
+           << "Player* = 0x" << std::hex << (uint64_t)localPlayer << "\n\n";
+
+    posOut << "[Sample 1]\n";
+    float s1_320x = *(float *)(rawBase + 0x320);
+    float s1_320y = *(float *)(rawBase + 0x324);
+    float s1_320z = *(float *)(rawBase + 0x328);
+    float s1_7e8x = *(float *)(rawBase + 0x7E8);
+    float s1_7e8y = *(float *)(rawBase + 0x7EC);
+    float s1_7e8z = *(float *)(rawBase + 0x7F0);
+    posOut << "  +0x320 = (" << s1_320x << ", " << s1_320y << ", " << s1_320z << ")\n";
+    posOut << "  +0x7E8 = (" << s1_7e8x << ", " << s1_7e8y << ", " << s1_7e8z << ")\n";
+    posOut << "  CurHP = " << std::dec << curHP << "\n";
+
+    sleep(5);
+
+    posOut << "\n[Sample 2 — 5s later]\n";
+    float s2_320x = *(float *)(rawBase + 0x320);
+    float s2_320y = *(float *)(rawBase + 0x324);
+    float s2_320z = *(float *)(rawBase + 0x328);
+    float s2_7e8x = *(float *)(rawBase + 0x7E8);
+    float s2_7e8y = *(float *)(rawBase + 0x7EC);
+    float s2_7e8z = *(float *)(rawBase + 0x7F0);
+    posOut << "  +0x320 = (" << s2_320x << ", " << s2_320y << ", " << s2_320z << ")\n";
+    posOut << "  +0x7E8 = (" << s2_7e8x << ", " << s2_7e8y << ", " << s2_7e8z << ")\n";
+
+    bool moved_320 = (s1_320x != s2_320x || s1_320y != s2_320y || s1_320z != s2_320z);
+    bool moved_7e8 = (s1_7e8x != s2_7e8x || s1_7e8y != s2_7e8y || s1_7e8z != s2_7e8z);
+    posOut << "\n  +0x320 changed: " << (moved_320 ? "YES" : "NO") << "\n";
+    posOut << "  +0x7E8 changed: " << (moved_7e8 ? "YES" : "NO") << "\n";
+
+    posOut.close();
+    LOGI("=== PHASE 7b (Position) DONE — %s ===", posPath.c_str());
 }
 
 // ============================================================
