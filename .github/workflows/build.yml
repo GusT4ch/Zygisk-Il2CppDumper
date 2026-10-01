@@ -45,7 +45,15 @@ jobs:
     - name: Build read_pos (Android x86_64)
       run: |
         TOOLCHAIN="${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64"
-        CC="$TOOLCHAIN/bin/x86_64-linux-android24-clang"
+        echo "=== NDK path ==="
+        echo "${{ steps.ndk.outputs.ndk-path }}"
+        echo "=== Toolchain contents ==="
+        ls -la "$TOOLCHAIN/bin/" | grep -i "x86_64-linux-android" | head -20
+        echo "=== Find clang ==="
+        find "$TOOLCHAIN/bin/" -name "x86_64*clang" | head -5
+        # Pick any available x86_64 android clang
+        CC=$(find "$TOOLCHAIN/bin/" -name "x86_64-linux-android*-clang" | head -1)
+        echo "Using CC=$CC"
         mkdir -p out/tools
         "$CC" -O2 -static -o out/tools/read_pos tools/read_pos/read_pos.c
         file out/tools/read_pos
