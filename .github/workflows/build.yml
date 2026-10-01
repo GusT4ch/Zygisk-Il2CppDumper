@@ -36,26 +36,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v3
-    - name: Setup NDK
-      id: ndk
-      uses: nttld/setup-ndk@v1
-      with:
-        ndk-version: r26d
-        local-cache: true
+    - name: Download NDK directly
+      run: |
+        wget -q https://dl.google.com/android/repository/android-ndk-r26d-linux.zip -O ndk.zip
+        unzip -q ndk.zip
+        echo "NDK=$PWD/android-ndk-r26d" >> $GITHUB_ENV
     - name: Build read_pos (Android x86_64)
       run: |
-        TOOLCHAIN="${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64"
-        echo "=== NDK path ==="
-        echo "${{ steps.ndk.outputs.ndk-path }}"
-        echo "=== Toolchain contents ==="
-        ls -la "$TOOLCHAIN/bin/" | grep -i "x86_64-linux-android" | head -20
-        echo "=== Find clang ==="
-        find "$TOOLCHAIN/bin/" -name "x86_64*clang" | head -5
-        # Pick any available x86_64 android clang
-        CC=$(find "$TOOLCHAIN/bin/" -name "x86_64-linux-android*-clang" | head -1)
-        echo "Using CC=$CC"
+        TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64"
+        ls "$TOOLCHAIN/bin/clang"
         mkdir -p out/tools
-        "$CC" -O2 -static -o out/tools/read_pos tools/read_pos/read_pos.c
+        "$TOOLCHAIN/bin/clang" --target=x86_64-linux-android26 \
+          -O2 -static -o out/tools/read_pos tools/read_pos/read_pos.c
         file out/tools/read_pos
         ls -la out/tools/
     - uses: actions/upload-artifact@v4
