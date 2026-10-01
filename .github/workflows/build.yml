@@ -31,3 +31,26 @@ jobs:
       with:
         name: zygisk-offset-resolver
         path: out/magisk_module_release/
+
+  build_tools:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    - name: Setup NDK
+      id: ndk
+      uses: nttld/setup-ndk@v1
+      with:
+        ndk-version: r26d
+        local-cache: true
+    - name: Build read_pos (Android x86_64)
+      run: |
+        TOOLCHAIN="${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64"
+        CC="$TOOLCHAIN/bin/x86_64-linux-android24-clang"
+        mkdir -p out/tools
+        "$CC" -O2 -static -o out/tools/read_pos tools/read_pos/read_pos.c
+        file out/tools/read_pos
+        ls -la out/tools/
+    - uses: actions/upload-artifact@v4
+      with:
+        name: phantom-tools
+        path: out/tools/
