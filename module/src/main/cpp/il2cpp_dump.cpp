@@ -13,6 +13,7 @@
 #include <fstream>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <thread>
 #include "xdl.h"
 #include "log.h"
@@ -2704,6 +2705,19 @@ static void resolve_offsets_phase8(std::string outDir) {
 // ============================================================
 
 void il2cpp_dump(const char *outDir) {
+    // Skip the heavy IL2CPP dump if dump.cs already exists.
+    // The dump makes millions of API calls through libhoudini on
+    // x86_64 emulators, which destabilizes FF 1.132.9 on LDPlayer.
+    // We already have the dump from previous sessions; the offset
+    // resolver (resolve_offsets) is all we need to run per-match.
+    auto dumpPath = std::string(outDir).append("/files/dump.cs");
+    struct stat st{};
+    if (stat(dumpPath.c_str(), &st) == 0 && st.st_size > 1024 * 1024) {
+        LOGI("dump.cs exists (%ld bytes) — skipping Phase 1 dump", (long)st.st_size);
+        resolve_offsets(outDir);
+        return;
+    }
+
     LOGI("dumping...");
     size_t size;
     auto domain = il2cpp_domain_get();
