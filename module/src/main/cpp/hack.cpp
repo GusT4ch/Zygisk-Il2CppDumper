@@ -19,9 +19,11 @@
 
 void hack_start(const char *game_data_dir) {
     bool load = false;
-    for (int i = 0; i < 10; i++) {
+    // FF 1.132.9: anti-cheat delays libil2cpp load — poll for up to 2 min
+    for (int i = 0; i < 120; i++) {
         void *handle = xdl_open("libil2cpp.so", 0);
         if (handle) {
+            LOGI("libil2cpp.so found after %d seconds", i);
             load = true;
             il2cpp_api_init(handle);
             il2cpp_dump(game_data_dir);
@@ -31,7 +33,7 @@ void hack_start(const char *game_data_dir) {
         }
     }
     if (!load) {
-        LOGI("libil2cpp.so not found in thread %d", gettid());
+        LOGI("libil2cpp.so not found after 120s in thread %d", gettid());
     }
 }
 
