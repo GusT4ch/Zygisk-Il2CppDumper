@@ -1071,11 +1071,9 @@ static void resolve_offsets(const char *outDir) {
     std::string dirCopy5(outDir);
     std::thread phase6(resolve_offsets_phase6, dirCopy5);
     phase6.detach();
-    std::string dirCopy6(outDir);
-    std::thread phase7(resolve_offsets_phase7, dirCopy6);
-    phase7.detach();
-    // Phase 8 disabled — extra thread crashes FF. Position validation moved into Phase 7.
-    LOGI("Phase 2-7 threads spawned (Position validation in Phase 7b)");
+    // Phase 7 & 8 disabled — isolating crash on FF 1.132.9.
+    (void)resolve_offsets_phase7;
+    LOGI("Phase 2-6 threads spawned (Phase 7/8 disabled for 1.132.9 debug)");
 }
 
 // ============================================================
